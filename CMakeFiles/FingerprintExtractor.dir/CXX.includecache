@@ -1,0 +1,20 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/mehmet/c_projects/fp-extractor/src/fp_extractor_example.cpp
+iostream
+-
+fstream
+-
+string
+-
+FJFX.h
+/home/mehmet/c_projects/fp-extractor/src/FJFX.h
+FRFXLL.h
+/home/mehmet/c_projects/fp-extractor/src/FRFXLL.h
+

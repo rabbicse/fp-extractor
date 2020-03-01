@@ -1,0 +1,16 @@
+/opt/CLion-2019.3.4/clion-2019.3.4/bin/cmake/linux/bin/cmake -DCMAKE_BUILD_TYPE= -G "CodeBlocks - Unix Makefiles" /home/mehmet/c_projects/fp-extractor
+-- Configuring done
+CMake Error at CMakeLists.txt:7 (add_executable):
+  Cannot find source file:
+
+    src/include/FJFX.h
+
+  Tried extensions .c .C .c++ .cc .cpp .cxx .cu .m .M .mm .h .hh .h++ .hm
+  .hpp .hxx .in .txx
+
+
+CMake Error at CMakeLists.txt:7 (add_executable):
+  No SOURCES given to target: FingerprintExtractor
+
+
+CMake Generate step failed.  Build files cannot be regenerated correctly.

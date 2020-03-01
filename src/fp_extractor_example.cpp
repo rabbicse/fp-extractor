@@ -1,6 +1,7 @@
 #include <iostream>
 #include<fstream>
 #include<string>
+#include <cstring>
 #include "FJFX.h"
 #include "FRFXLL.h"
 
@@ -83,30 +84,58 @@ int fjfx_create_fmd_from_raw(
   return FJFX_SUCCESS;
 }
 
+const unsigned char* convertToRaw(const char* fileName)
+{
+    /* declaration */
+    unsigned char* memblock = NULL;
+    streampos size;
+
+    /* read bytes from bmp file */
+    ifstream bmpFile(fileName, ios::in | ios::binary | ios::ate);
+    if (bmpFile.good())
+    {
+        size = bmpFile.tellg();
+        memblock = new unsigned char[size];
+        bmpFile.seekg(0, ios::beg);
+        bmpFile.read((char*)memblock, size);
+        bmpFile.close();
+        cout << "size is: " << size << " bytes.\n";
+    }
+
+
+    /* create minex from bmp */
+    const unsigned char* imageRaw = &memblock[0];
+    // unsigned int imageSize = (unsigned int)size;
+    return imageRaw;
+}
 
 
 int main()
 {
-	/* declaration */
-    unsigned char* memblock = NULL;
-	streampos size;
+//	/* declaration */
+//    unsigned char* memblock = NULL;
+//	streampos size;
+//
+//	/* read bytes from bmp file */
+//	ifstream bmpFile("/home/mehmet/c_projects/fp_demo/engine_demo/bin/b.bmp", ios::in | ios::binary | ios::ate);
+//	if (bmpFile.good())
+//	{
+//		size = bmpFile.tellg();
+//		memblock = new unsigned char[size];
+//		bmpFile.seekg(0, ios::beg);
+//		bmpFile.read((char*)memblock, size);
+//		bmpFile.close();
+//		cout << "size is: " << size << " bytes.\n";
+//	}
+//
+//
+//	/* create minex from bmp */
+//	const unsigned char* imageRaw = &memblock[0];
+//	// unsigned int imageSize = (unsigned int)size;
 
-	/* read bytes from bmp file */
-	ifstream bmpFile("/home/mehmet/c_projects/fp_demo/engine_demo/bin/b.bmp", ios::in | ios::binary | ios::ate);
-	if (bmpFile.good())
-	{
-		size = bmpFile.tellg();
-		memblock = new unsigned char[size];
-		bmpFile.seekg(0, ios::beg);
-		bmpFile.read((char*)memblock, size);
-		bmpFile.close();
-		cout << "size is: " << size << " bytes.\n";
-	}
+    const char* inFile = "/home/mehmet/c_projects/fp_demo/engine_demo/bin/b.bmp";
+    const unsigned char* imageRaw = convertToRaw(inFile);
 
-
-	/* create minex from bmp */
-	const unsigned char* imageRaw = &memblock[0];
-	// unsigned int imageSize = (unsigned int)size;
 
 	/* get max size for the feature template */
 	unsigned int nFeaturesSize = FJFX_FMD_BUFFER_SIZE;
@@ -119,28 +148,54 @@ int main()
 	}
 
 
+    cout << "============== create bmp 2 ================" << endl;
+    const char* inFile1 = "/home/mehmet/Downloads/fp-match/minex/input/test.bmp";
+    const unsigned char* imageRaw1 = convertToRaw(inFile1);
+
+
+    /* get max size for the feature template */
+    unsigned int nFeaturesSize1 = FJFX_FMD_BUFFER_SIZE;
+    unsigned char* pFeatures1 = (unsigned char*)malloc(nFeaturesSize1);
+    int ret1 = fjfx_create_fmd_from_raw(imageRaw1, 500, 480, 320, FJFX_FMD_ANSI_378_2004, pFeatures1, &nFeaturesSize1);
+    cout << ret1 << endl;
+    if (ret1 == FRFXLL_OK)
+    {
+        cout << "Success" << endl;
+    }
 
 
 
 
 
-	delete[] memblock;
+	int sc = memcmp(pFeatures, pFeatures1, nFeaturesSize);
+	cout << "match score: ";
+	cout << sc << endl;
 
-	try {
-		/* write minex to file */
-		// ofstream wf("/home/mehmet/c_projects/fp_demo/engine_demo/bin/fp.minex", ios::out | ios::binary);
-		ofstream wf("fp.minex", ios::out | ios::binary);
-		if (wf.good())
-		{
-			wf.write((char*)pFeatures, nFeaturesSize);
-		}
-		wf.close();
-	}
-	catch (exception x) 
-	{
-		cout << "Exception" << endl;
-	}
+//	delete[] memblock;
+
+//	try {
+//		/* write minex to file */
+//		// ofstream wf("/home/mehmet/c_projects/fp_demo/engine_demo/bin/fp.minex", ios::out | ios::binary);
+//		ofstream wf("fp.minex", ios::out | ios::binary);
+//		if (wf.good())
+//		{
+//			wf.write((char*)pFeatures, nFeaturesSize);
+//		}
+//		wf.close();
+//	}
+//	catch (exception x)
+//	{
+//		cout << "Exception" << endl;
+//	}
 
 	cout << "Done..." << endl;
+    return 0;
+}
+
+int compare(unsigned char *a, unsigned char *b, int size) {
+    while(size-- > 0) {
+        if ( *a != *b ) { return (*a < *b ) ? -1 : 1; }
+        a++; b++;
+    }
     return 0;
 }

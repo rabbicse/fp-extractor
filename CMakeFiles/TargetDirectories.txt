@@ -1,0 +1,3 @@
+/home/mehmet/c_projects/fp-extractor/CMakeFiles/rebuild_cache.dir
+/home/mehmet/c_projects/fp-extractor/CMakeFiles/FingerprintExtractor.dir
+/home/mehmet/c_projects/fp-extractor/CMakeFiles/edit_cache.dir
