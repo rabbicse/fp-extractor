@@ -51,3 +51,21 @@ jobs:
         run: |
           cd deploy && touch .env
           FPX_IMAGE=example/image:tag docker compose -f docker-compose.prod.yml config -q
+
+  docker-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image (runs the test suite inside the build stage)
+        run: docker build -f docker/Dockerfile -t fpx:ci .
+      - name: Smoke test container, API and HEALTHCHECK
+        run: |
+          docker run -d --name fpx -p 8080:8080 -e FPX_API_KEY=ci fpx:ci
+          for i in $(seq 1 60); do curl -fsS localhost:8080/healthz && break; sleep 2; done
+          curl -fsS -H 'X-API-Key: ci' localhost:8080/v1/stats
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/stats)" = 401
+          for i in $(seq 1 30); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' fpx); echo "health: $s"
+            [ "$s" = healthy ] && exit 0; sleep 5
+          done
+          docker logs fpx; exit 1
