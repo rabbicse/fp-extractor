@@ -92,9 +92,13 @@ same pattern class are more alike. Before production:
 
 ## Improving accuracy further (ideas, in order of value)
 
-* **Enrol several fingers / impressions per customer** and fuse scores
-  (max or sum). Two fingers reduce 1:N false matches by orders of magnitude
-  and are the standard way large AFIS systems reach low FPIR.
+* **Enrol several fingers per customer** and fuse scores. *Implemented
+  (v2.1):* `Gallery::identify_subjects` / the server's `fingers` requests
+  apply a `FusionPolicy`: with ≥ 2 fingers presented, all must reach 12
+  (`finger_threshold`, `min_fingers`) or one must reach 30
+  (`strong_single_threshold`); with one finger the single-finger threshold 18
+  applies. Measured at 1 M customers × 2 fingers: 20/20 genuine accepted,
+  0 false alarms (see [SCALING.md](SCALING.md)).
 * Quality gate at capture: reject images with < 12 minutiae or low contrast,
   ask for a re-scan.
 * Store 2–3 enrolment impressions per finger (template fusion or best-of).

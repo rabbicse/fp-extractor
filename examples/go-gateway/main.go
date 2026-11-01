@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -35,9 +36,11 @@ type gateway struct {
 }
 
 type candidate struct {
-	ID    string  `json:"id"`
-	Score float64 `json:"score"`
-	Match bool    `json:"match"`
+	ID             string            `json:"id"`
+	Score          float64           `json:"score"` // fused score (sum over fingers)
+	Match          bool              `json:"match"`
+	FingersMatched int               `json:"fingers_matched"`
+	Fingers        []json.RawMessage `json:"fingers,omitempty"`
 }
 
 type identifyResp struct {
@@ -87,15 +90,24 @@ func (g *gateway) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// PUT|POST|DELETE /v1/subjects/{id} -> owning shard.
+// /v1/subjects/{id}[/fingers/{pos}] (GET|PUT|POST|DELETE) -> owning shard.
+// Routing uses the subject id only, so all fingers of a customer live on the
+// same shard and multi-finger fusion works there.
 func (g *gateway) subjects(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/v1/subjects/")
-	if id == "" || strings.Contains(id, "/") {
+	rest := strings.TrimPrefix(r.URL.EscapedPath(), "/v1/subjects/")
+	parts := strings.Split(rest, "/")
+	valid := parts[0] != "" && (len(parts) == 1 || (len(parts) == 3 && parts[1] == "fingers" && parts[2] != ""))
+	if !valid {
+		writeJSON(w, 400, map[string]string{"error": "expected /v1/subjects/{id} or /v1/subjects/{id}/fingers/{position}"})
+		return
+	}
+	id, err := url.PathUnescape(parts[0])
+	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": "bad id"})
 		return
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 20<<20))
-	status, out, err := g.forward(r.Context(), r.Method, g.shardFor(id)+"/v1/subjects/"+id, body)
+	status, out, err := g.forward(r.Context(), r.Method, g.shardFor(id)+"/v1/subjects/"+rest, body)
 	if err != nil {
 		writeJSON(w, 502, map[string]string{"error": err.Error()})
 		return
@@ -171,7 +183,13 @@ func (g *gateway) identify(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 502, map[string]any{"error": "all shards failed", "details": errs})
 		return
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].Score > all[j].Score })
+	// Same ordering as a single shard: accepted matches first, then fused score.
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Match != all[j].Match {
+			return all[i].Match
+		}
+		return all[i].Score > all[j].Score
+	})
 	if len(all) > req.TopK {
 		all = all[:req.TopK]
 	}

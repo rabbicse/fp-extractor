@@ -1,0 +1,142 @@
+# Continuous deployment:
+#   push to master/main  -> test -> build image -> push to GHCR -> deploy to "production"
+#   push tag v*.*.*      -> same, image also tagged with the version
+#   manual (Actions tab) -> deploy any branch/tag
+#
+# One-time setup (see docs/DEPLOYMENT.md):
+#   * Settings -> Environments -> "production": add required reviewers if you
+#     want a manual approval step before each deploy.
+#   * Repository variables (Settings -> Secrets and variables -> Actions ->
+#     Variables): DEPLOY_HOST, DEPLOY_USER, optional DEPLOY_PORT (22),
+#     DEPLOY_PATH (~/fp-extractor), DEPLOY_HEALTH_URL. DEPLOY_HOST must be a
+#     *repository* variable: the job-level `if` is evaluated before the
+#     environment is attached.
+#   * Environment secrets: DEPLOY_SSH_KEY (private key), DEPLOY_KNOWN_HOSTS
+#     (output of `ssh-keyscan -p PORT HOST`), optional GHCR_PULL_TOKEN
+#     (read:packages PAT; only needed while the image is private).
+# Without DEPLOY_HOST the workflow still tests, builds and publishes the image
+# and simply skips the deploy job.
+name: Deploy
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: environment
+        default: production
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false   # never interrupt a running deployment
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke-test the published image
+        run: |
+          docker run -d --name fpx -p 8080:8080 -e FPX_API_KEY=ci ${{ env.IMAGE }}:sha-${GITHUB_SHA::7}
+          for i in $(seq 1 60); do curl -fsS localhost:8080/healthz && break; sleep 2; done
+          curl -fsS -H 'X-API-Key: ci' localhost:8080/v1/stats
+          docker logs fpx
+      - id: ref
+        # Deploy by immutable sha tag, never by a moving tag like :latest.
+        run: echo "ref=${{ env.IMAGE }}:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: image
+    runs-on: ubuntu-24.04
+    environment:
+      name: ${{ inputs.environment || 'production' }}
+    if: vars.DEPLOY_HOST != ''
+    env:
+      HOST: ${{ vars.DEPLOY_HOST }}
+      USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+      PORT: ${{ vars.DEPLOY_PORT || '22' }}
+      DIR: ${{ vars.DEPLOY_PATH || '~/fp-extractor' }}
+      HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL || 'http://127.0.0.1:8080/healthz' }}
+      IMAGE_REF: ${{ needs.image.outputs.ref }}
+      HAS_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$SSH_KEY" || { echo "::error::secret DEPLOY_SSH_KEY is not set"; exit 1; }
+          test -n "$KNOWN_HOSTS" || { echo "::error::secret DEPLOY_KNOWN_HOSTS is not set (ssh-keyscan output)"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host target\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile ~/.ssh/id_deploy\n  StrictHostKeyChecking yes\n' \
+            "$HOST" "$USER" "$PORT" > ~/.ssh/config
+      - name: Upload compose file and deploy script
+        run: |
+          ssh target "mkdir -p $DIR"
+          scp deploy/docker-compose.prod.yml "target:$DIR/docker-compose.yml"
+          scp deploy/remote-deploy.sh "target:$DIR/remote-deploy.sh"
+          ssh target "chmod +x $DIR/remote-deploy.sh"
+      - name: Registry login on the server (private images only)
+        env:
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        if: env.HAS_PULL_TOKEN == 'true'
+        run: printf '%s' "$GHCR_PULL_TOKEN" | ssh target "docker login ghcr.io -u '${{ github.repository_owner }}' --password-stdin"
+      - name: Deploy (pull, restart, health check, auto-rollback)
+        run: ssh target "$DIR/remote-deploy.sh '$IMAGE_REF' '$HEALTH_URL'"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deployment"
+            echo "- image: \`$IMAGE_REF\`"
+            echo "- host: \`$HOST\`"
+            echo "- result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

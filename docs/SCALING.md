@@ -25,8 +25,30 @@ identify threshold of 18, and 1 of 40 genuine probes scored below 18 (the
 right person was still rank 1). Single-finger 1:N at a million is hard for any
 matcher. For production, **enrol and search two fingers per customer** and
 require both to agree (or fuse scores); that pushes false matches down by
-orders of magnitude and is standard practice for large AFIS systems. See
+orders of magnitude and is standard practice for large AFIS systems. This is
+built in since v2.1 (server, CLI, Go gateway); results below. See
 [MATCHING.md](MATCHING.md#improving-accuracy-further-ideas-in-order-of-value).
+
+### Two fingers per customer (recommended)
+
+```
+$ fpx bench --gallery 1000000 --probes 20 --fingers 2
+gallery ready: 1000000 subjects, 2000000 templates, ~2997 MB, built in 26.6 s
+2-finger 1:N search over 1000000 subjects / 2000000 templates (threads=4)
+  policy:           both fingers >= 12, or one finger >= 30
+  avg latency:      9867.2 ms   (worst 14600.1 ms)
+  rank-1:           20 / 20 correct, 20 / 20 also accepted by the policy
+  weakest genuine finger score (rank-1 hits): 15.8
+  impostor searches (10 non-enrolled people): 0 false alarms; best single finger 15.2, best fused 15.2
+```
+
+Compared with one finger: every genuine customer is now accepted (single
+finger: 39/40), and a stranger would need **both** fingers to coincidentally
+reach 12 against the **same** customer. In 10 M stranger comparisons per
+finger, no customer had even two fingers above 12 (best fused score 15.2 =
+one finger only). Cost: twice the comparisons and RAM (each probe finger is
+compared only with enrolled fingers of the same position), i.e. ~10 s on
+4 cores, ~2.5 s on 16 cores for 1 M customers.
 
 Rules of thumb (synthetic templates averaging 40 minutiae; real FingerJet
 templates often have more, so budget up to 2×):
@@ -36,6 +58,7 @@ templates often have more, so budget up to 2×):
 | 100 k | 0.15 GB | 0.5 s | ~0.15 s | — |
 | 1 M | 1.5 GB | 5 s | ~1.3 s | ~0.3 s |
 | 10 M | 15 GB | 50 s | ~13 s | ~3 s |
+| 1 M customers × 2 fingers | 3 GB | 10 s | ~2.5 s | ~0.6 s |
 
 Run `fpx bench --gallery N` on the target machine to get real numbers.
 

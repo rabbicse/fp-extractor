@@ -16,26 +16,58 @@ Content-Type: application/json
 
 {"image": "<base64 image>", "dpi": 500, "format": "ansi", "wsq": true}
 
-### Enrol / replace (template preferred; "image" also accepted)
+### Enrol / replace a customer with two fingers (template preferred; "image" also accepted)
+# position: 1 R-thumb, 2 R-index, 3 R-middle, 4 R-ring, 5 R-little, 6 L-thumb, 7 L-index, ...
 PUT {{host}}/v1/subjects/customer-42
 X-API-Key: {{key}}
 Content-Type: application/json
 
-{"template": "<base64 ANSI-378 or ISO-19794-2>"}
+{"fingers": [
+  {"position": 2, "template": "<base64 ANSI-378 or ISO-19794-2>"},
+  {"position": 7, "image": "<base64 BMP/WSQ>", "dpi": 500}
+]}
 
-### 1:N identification
+### Add or replace one finger
+PUT {{host}}/v1/subjects/customer-42/fingers/3
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"template": "<base64>"}
+
+### List a customer's enrolled fingers
+GET {{host}}/v1/subjects/customer-42
+X-API-Key: {{key}}
+
+### Remove one finger
+DELETE {{host}}/v1/subjects/customer-42/fingers/3
+X-API-Key: {{key}}
+
+### 1:N identification with two fingers (fused per customer)
 POST {{host}}/v1/identify
 X-API-Key: {{key}}
 Content-Type: application/json
 
-{"template": "<base64>", "top_k": 5}
+{"fingers": [
+  {"position": 2, "template": "<base64>"},
+  {"position": 7, "template": "<base64>"}
+], "top_k": 5}
 
-### 1:1 verification against an enrolled id
+### 1:N with a single finger (stricter single-finger threshold applies)
+POST {{host}}/v1/identify
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"position": 2, "template": "<base64>", "top_k": 5}
+
+### 1:1 verification against an enrolled id (one or more fingers)
 POST {{host}}/v1/verify
 X-API-Key: {{key}}
 Content-Type: application/json
 
-{"id": "customer-42", "template": "<base64>"}
+{"id": "customer-42", "fingers": [
+  {"position": 2, "template": "<base64>"},
+  {"position": 7, "template": "<base64>"}
+]}
 
 ### 1:1 of two templates (nothing stored)
 POST {{host}}/v1/match

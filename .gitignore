@@ -26,3 +26,6 @@ data/
 *.lib
 *.exe
 *.out
+
+# deployment secrets
+.env

@@ -34,10 +34,14 @@ Conversion / extraction
 
 Matching
   match <a> <b> [--threshold T] [-v]  1:1 compare; a/b may be templates or images
-  enroll   --db <file> --id <id> <template|image> [--dpi N]
-  remove   --db <file> --id <id>
-  identify --db <file> <template|image> [--top 10] [--threads N] [--threshold T]
+  enroll   --db <file> --id <id> <file> [<file2> ...] [--fingers 2,7 | --finger N]
+                                      Enrol one or more fingers (positions 1..10, 0 = unknown;
+                                      default: position stored in the template header)
+  remove   --db <file> --id <id> [--finger N]   Remove a finger, or the whole subject
+  identify --db <file> <file> [<file2> ...] [--fingers 2,7] [--top 10] [--threads N]
+                                      1:N with one or several fingers (fused per subject)
   compact  --db <file>                Rewrite the store keeping only live records
+                                      (offline only! for a running server use POST /v1/admin/compact)
 
 Testing / benchmarking
   synth -o <out.bmp> [--finger N] [--impression K] [--width 320 --height 400]
@@ -46,8 +50,9 @@ Testing / benchmarking
   eval <dir> [--dpi N]                Accuracy (EER, FMR100, FMR1000) on an FVC-style folder
                                       (files named <finger>_<impression>.bmp|tif|pgm|wsq)
   eval --synthetic FxI                Same, on F synthetic fingers x I impressions (e.g. 20x4)
-  bench [--gallery 100000] [--probes 20] [--threads N]
-                                      1:N speed benchmark on synthetic templates
+  bench [--gallery 100000] [--probes 20] [--threads N] [--fingers 1|2]
+                                      1:N benchmark on synthetic templates; --fingers 2 enrols
+                                      and searches two fingers (right + left index) per subject
 
 Common options: --dpi N (default 500 when the file has none), -v/--verbose,
   --matcher "key=value,..."  override matcher parameters (see include/fpx/matcher.hpp)
@@ -203,38 +208,84 @@ void load_gallery(TemplateStore& store, Gallery& g, bool quiet = false) {
     std::string warn;
     size_t bad = 0;
     store.replay(
-        [&](const std::string& id, const std::vector<uint8_t>& rec) {
+        [&](const std::string& key, const std::vector<uint8_t>& rec) {
             try {
-                g.insert(id, parse_template(rec));
+                auto [subject, finger] = split_store_key(key);
+                g.insert(subject, finger, parse_template(rec));
             } catch (const Error&) {
                 ++bad;
             }
         },
-        [&](const std::string& id) { g.remove(id); }, &warn);
+        [&](const std::string& key) {
+            try {
+                auto [subject, finger] = split_store_key(key);
+                g.remove(subject, finger);
+            } catch (const Error&) {
+                ++bad;
+            }
+        },
+        &warn);
     if (!warn.empty()) std::fprintf(stderr, "warning: %s\n", warn.c_str());
-    if (bad) std::fprintf(stderr, "warning: %zu undecodable templates skipped\n", bad);
+    if (bad) std::fprintf(stderr, "warning: %zu undecodable records skipped\n", bad);
     if (!quiet)
-        std::fprintf(stderr, "loaded %zu templates from %s in %.0f ms\n", g.size(), store.path().c_str(), now_ms() - t0);
+        std::fprintf(stderr, "loaded %zu subjects / %zu finger templates from %s in %.0f ms\n", g.subjects(), g.size(),
+                     store.path().c_str(), now_ms() - t0);
+}
+
+uint8_t finger_arg(int v) {
+    if (v < 0 || v > kMaxFingerPosition) throw Error("finger position must be 0..10");
+    return uint8_t(v);
+}
+
+// "--fingers 2,7" -> {2, 7}
+std::vector<uint8_t> finger_list(const std::string& spec) {
+    std::vector<uint8_t> out;
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        size_t end = spec.find(',', pos);
+        if (end == std::string::npos) end = spec.size();
+        if (end > pos) out.push_back(finger_arg(std::stoi(spec.substr(pos, end - pos))));
+        pos = end + 1;
+    }
+    return out;
 }
 
 int cmd_enroll(const Args& a) {
-    if (!a.has("--db") || !a.has("--id") || a.pos.size() != 1) throw Error("usage: fpx enroll --db F --id ID <file>");
-    std::vector<uint8_t> rec;
-    auto t = load_any(a.pos[0], a.geti("--dpi", 500), &rec);
-    if (t.minutiae.size() < 3) throw Error("template has too few minutiae to be useful");
+    if (!a.has("--db") || !a.has("--id") || a.pos.empty())
+        throw Error("usage: fpx enroll --db F --id ID <file> [<file2> ...] [--fingers 2,7]");
+    const std::string id = a.get("--id");
+    if (!valid_subject_id(id)) throw Error("id must be 1..256 characters without control characters");
+    std::vector<uint8_t> positions;
+    if (a.has("--fingers")) positions = finger_list(a.get("--fingers"));
+    else if (a.has("--finger")) positions = {finger_arg(a.geti("--finger", 0))};
+    if (!positions.empty() && positions.size() != a.pos.size())
+        throw Error("--fingers must list one position per file");
     TemplateStore store(a.get("--db"));
-    store.put(a.get("--id"), rec);
+    uint32_t seen = 0;
+    for (size_t i = 0; i < a.pos.size(); ++i) {
+        std::vector<uint8_t> rec;
+        auto t = load_any(a.pos[i], a.geti("--dpi", 500), &rec);
+        if (t.minutiae.size() < 6) throw Error(a.pos[i] + ": too few minutiae, re-scan");
+        uint8_t pos = positions.empty() ? (t.finger_position <= 10 ? t.finger_position : 0) : positions[i];
+        if ((seen >> pos) & 1u) throw Error("finger position " + std::to_string(pos) + " given twice (use --fingers)");
+        seen |= 1u << pos;
+        store.put(make_store_key(id, pos), rec);
+        std::printf("enrolled '%s' finger %u (%zu minutiae)\n", id.c_str(), pos, t.minutiae.size());
+    }
     store.sync();
-    std::printf("enrolled '%s' (%zu minutiae) into %s\n", a.get("--id").c_str(), t.minutiae.size(), a.get("--db").c_str());
     return 0;
 }
 
 int cmd_remove(const Args& a) {
-    if (!a.has("--db") || !a.has("--id")) throw Error("usage: fpx remove --db F --id ID");
+    if (!a.has("--db") || !a.has("--id")) throw Error("usage: fpx remove --db F --id ID [--finger N]");
     TemplateStore store(a.get("--db"));
-    store.erase(a.get("--id"));
+    if (a.has("--finger")) {
+        store.erase(make_store_key(a.get("--id"), finger_arg(a.geti("--finger", 0))));
+    } else {
+        for (int f = 0; f <= kMaxFingerPosition; ++f) store.erase(make_store_key(a.get("--id"), uint8_t(f)));
+    }
     store.sync();
-    std::printf("removed '%s'\n", a.get("--id").c_str());
+    std::printf("removed '%s'%s\n", a.get("--id").c_str(), a.has("--finger") ? (" finger " + a.get("--finger")).c_str() : "");
     return 0;
 }
 
@@ -247,22 +298,37 @@ int cmd_compact(const Args& a) {
 }
 
 int cmd_identify(const Args& a) {
-    if (!a.has("--db") || a.pos.size() != 1) throw Error("usage: fpx identify --db F <file>");
-    auto probe = load_any(a.pos[0], a.geti("--dpi", 500));
+    if (!a.has("--db") || a.pos.empty())
+        throw Error("usage: fpx identify --db F <file> [<file2> ...] [--fingers 2,7]");
+    std::vector<uint8_t> positions;
+    if (a.has("--fingers")) positions = finger_list(a.get("--fingers"));
+    if (!positions.empty() && positions.size() != a.pos.size()) throw Error("--fingers must list one position per file");
+    std::vector<FingerProbe> probes;
+    for (size_t i = 0; i < a.pos.size(); ++i) {
+        auto t = load_any(a.pos[i], a.geti("--dpi", 500));
+        uint8_t pos = positions.empty() ? (t.finger_position <= 10 ? t.finger_position : 0) : positions[i];
+        probes.push_back({pos, std::move(t)});
+    }
     TemplateStore store(a.get("--db"));
     Gallery g(g_cfg);
     load_gallery(store, g);
-    IdentifyOptions o;
+    SubjectIdentifyOptions o;
     o.top_k = a.geti("--top", 10);
     o.threads = a.geti("--threads", 0);
-    auto r = g.identify(probe, o);
-    const float thr = float(a.getd("--threshold", kIdentifyThreshold));
-    std::printf("searched %llu templates in %.1f ms\n", (unsigned long long)r.compared, r.elapsed_ms);
-    std::printf("rank  score   decision  id\n");
+    if (a.has("--threshold")) o.policy.single_threshold = float(a.getd("--threshold", kIdentifyThreshold));
+    if (a.has("--finger-threshold")) o.policy.finger_threshold = float(a.getd("--finger-threshold", kVerifyThreshold));
+    auto r = g.identify_subjects(probes, o);
+    std::printf("%zu finger(s) presented, %llu finger comparisons in %.1f ms\n", probes.size(),
+                (unsigned long long)r.compared, r.elapsed_ms);
+    std::printf("rank  fused   decision  fingers  id  (per finger: position->enrolled score)\n");
     int rank = 1;
-    for (auto& c : r.candidates)
-        std::printf("%4d  %6.2f  %-8s  %s\n", rank++, c.score, c.score >= thr ? "MATCH" : "-", c.id.c_str());
-    return (!r.candidates.empty() && r.candidates[0].score >= thr) ? 0 : 1;
+    for (auto& c : r.candidates) {
+        std::printf("%4d  %6.2f  %-8s  %d/%zu      %s ", rank++, c.score, c.match ? "MATCH" : "-", c.fingers_matched,
+                    probes.size(), c.id.c_str());
+        for (auto& f : c.fingers) std::printf(" [%u->%u %.1f]", f.probe_finger, f.gallery_finger, f.score);
+        std::printf("\n");
+    }
+    return (!r.candidates.empty() && r.candidates[0].match) ? 0 : 1;
 }
 
 int cmd_synth(const Args& a) {
@@ -489,7 +555,105 @@ int cmd_demo(const Args& a) {
     return 0;
 }
 
+// Two fingers per subject (right index = 2, left index = 7), fused search.
+int cmd_bench_two_fingers(const Args& a) {
+    const size_t N = size_t(a.geti("--gallery", 100000));
+    const int P = a.geti("--probes", 20);
+    const int threads = a.geti("--threads", 0);
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const uint8_t F1 = 2, F2 = 7;
+    auto tmpl = [](uint64_t subject, uint8_t finger) { return synthesize_template(subject * 16 + finger); };
+    std::printf("building synthetic gallery: %zu subjects x 2 fingers (%zu templates) on %u threads...\n", N, 2 * N, hw);
+    Gallery g(g_cfg);
+    g.reserve(2 * N, 40);
+    double t0 = now_ms();
+    {
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        const size_t batch = 512;
+        for (unsigned w = 0; w < hw; ++w)
+            th.emplace_back([&] {
+                struct Item {
+                    std::string id;
+                    CompiledTemplate a, b;
+                };
+                std::vector<Item> buf;
+                for (;;) {
+                    size_t b = next.fetch_add(batch);
+                    if (b >= N) break;
+                    buf.clear();
+                    for (size_t i = b; i < std::min(N, b + batch); ++i)
+                        buf.push_back({"subject-" + std::to_string(i), compile(tmpl(i, F1), g_cfg), compile(tmpl(i, F2), g_cfg)});
+                    for (auto& x : buf) {
+                        g.insert(x.id, F1, x.a);
+                        g.insert(x.id, F2, x.b);
+                    }
+                }
+            });
+        for (auto& t : th) t.join();
+    }
+    std::printf("gallery ready: %zu subjects, %zu templates, ~%.0f MB, built in %.1f s\n", g.subjects(), g.size(),
+                g.memory_bytes() / 1048576.0, (now_ms() - t0) / 1000);
+
+    SubjectIdentifyOptions o;
+    o.top_k = 5;
+    o.threads = threads;
+    int hits = 0, rank1 = 0;
+    double total = 0, worst = 0;
+    float weakest_genuine_finger = 1e9f;
+    for (int p = 0; p < P; ++p) {
+        size_t target = size_t((uint64_t(p) * 2654435761u) % N);
+        std::vector<FingerProbe> probes = {{F1, perturb_template(tmpl(target, F1), 1000 + p)},
+                                           {F2, perturb_template(tmpl(target, F2), 5000 + p)}};
+        auto r = g.identify_subjects(probes, o);
+        total += r.elapsed_ms;
+        worst = std::max(worst, r.elapsed_ms);
+        const bool top_ok = !r.candidates.empty() && r.candidates[0].id == "subject-" + std::to_string(target);
+        rank1 += top_ok;
+        hits += top_ok && r.candidates[0].match;
+        if (top_ok)
+            for (auto& f : r.candidates[0].fingers) weakest_genuine_finger = std::min(weakest_genuine_finger, f.score);
+        if (a.has("--verbose") && !r.candidates.empty()) {
+            const auto& c = r.candidates[0];
+            std::printf("  probe %2d target %-8zu -> %-16s fused %6.1f %-5s", p, target, c.id.c_str(), c.score,
+                        c.match ? "MATCH" : "-");
+            for (auto& f : c.fingers) std::printf(" [%u: %.1f]", f.gallery_finger, f.score);
+            std::printf("  %.0f ms\n", r.elapsed_ms);
+        }
+    }
+    int false_alarms = 0;
+    float imp_fused = 0, imp_finger = 0;
+    const int I = std::max(1, P / 2);
+    for (int p = 0; p < I; ++p) {
+        const size_t stranger = N + 1000000 + size_t(p);
+        std::vector<FingerProbe> probes = {{F1, perturb_template(tmpl(stranger, F1), 7 + p)},
+                                           {F2, perturb_template(tmpl(stranger, F2), 9000 + p)}};
+        auto r = g.identify_subjects(probes, o);
+        if (r.candidates.empty()) continue;
+        false_alarms += r.candidates[0].match;
+        for (auto& c : r.candidates) {
+            imp_fused = std::max(imp_fused, c.score);
+            for (auto& f : c.fingers) imp_finger = std::max(imp_finger, f.score);
+        }
+    }
+    const double avg = total / P;
+    const FusionPolicy pol;
+    std::printf("\n2-finger 1:N search over %zu subjects / %zu templates (threads=%d)\n", N, 2 * N,
+                threads > 0 ? threads : int(hw));
+    std::printf("  policy:           both fingers >= %.0f, or one finger >= %.0f\n", pol.finger_threshold,
+                pol.strong_single_threshold);
+    std::printf("  avg latency:      %.1f ms   (worst %.1f ms)\n", avg, worst);
+    std::printf("  rank-1:           %d / %d correct, %d / %d also accepted by the policy\n", rank1, P, hits, P);
+    std::printf("  weakest genuine finger score (rank-1 hits): %.1f\n", weakest_genuine_finger);
+    std::printf("  impostor searches (%d non-enrolled people): %d false alarms; best single finger %.1f, best fused %.1f\n",
+                I, false_alarms, imp_finger, imp_fused);
+    std::printf("  projected time for 1,000,000 subjects (2 fingers) on this machine: %.2f s\n", avg * 1e6 / N / 1000.0);
+    return 0;
+}
+
 int cmd_bench(const Args& a) {
+    if (a.geti("--fingers", 1) == 2) return cmd_bench_two_fingers(a);
+    if (a.geti("--fingers", 1) != 1) throw Error("bench: --fingers must be 1 or 2");
     const size_t N = size_t(a.geti("--gallery", 100000));
     const int P = a.geti("--probes", 20);
     const int threads = a.geti("--threads", 0);

@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""Minimal REST client for fpx-server (standard library only).
+"""Minimal REST client for fpx-server / the Go gateway (standard library only).
 
-    python3 examples/python/client.py enroll   customer-1 finger.iso
-    python3 examples/python/client.py identify probe.ansi
-    python3 examples/python/client.py verify   customer-1 probe.bmp
-    FPX_URL=http://host:8080 FPX_API_KEY=secret python3 examples/python/client.py stats
+Fingers are given as FILE[:POSITION]; position 1..10 per ISO 19794-2
+(1 right thumb, 2 right index, 3 right middle, ... 6 left thumb, 7 left index, ...).
 
-Files ending in .iso/.ansi/.ist/.min/.tmpl are sent as templates, others as images.
+    python3 client.py enroll   cust-1 right_index.iso:2 left_index.bmp:7
+    python3 client.py identify probe_ri.ansi:2 probe_li.bmp:7
+    python3 client.py verify   cust-1 probe_ri.iso:2 probe_li.iso:7
+    python3 client.py add-finger cust-1 right_middle.bmp 3
+    python3 client.py get      cust-1
+    python3 client.py delete   cust-1
+    FPX_URL=http://host:8080 FPX_API_KEY=secret python3 client.py stats
+
+Files starting with "FMR\\0" (ANSI-378 / ISO-19794-2) are sent as templates,
+anything else (BMP/PGM/TIFF/WSQ) as images for server-side extraction.
 """
 import base64
 import json
 import os
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
 
 URL = os.environ.get("FPX_URL", "http://localhost:8080")
@@ -29,26 +38,40 @@ def call(method, path, body=None):
         return {"http_status": e.code, **json.load(e)}
 
 
-def payload(path):
+def finger(arg):
+    path, pos = arg, None
+    head, sep, tail = arg.rpartition(":")
+    if sep and tail.isdigit():
+        path, pos = head, int(tail)
     raw = open(path, "rb").read()
-    b64 = base64.b64encode(raw).decode()
-    is_template = raw[:4] == b"FMR\x00"
-    return {"template": b64} if is_template else {"image": b64}
+    item = {"template" if raw[:4] == b"FMR\x00" else "image": base64.b64encode(raw).decode()}
+    if pos is not None:
+        item["position"] = pos
+    return item
+
+
+def sid(s):
+    return urllib.parse.quote(s, safe="")
 
 
 if __name__ == "__main__":
     a = sys.argv[1:]
     if not a:
         sys.exit(__doc__)
-    if a[0] == "enroll":
-        out = call("PUT", f"/v1/subjects/{a[1]}", payload(a[2]))
-    elif a[0] == "identify":
-        out = call("POST", "/v1/identify", {**payload(a[1]), "top_k": 5})
-    elif a[0] == "verify":
-        out = call("POST", "/v1/verify", {"id": a[1], **payload(a[2])})
-    elif a[0] == "delete":
-        out = call("DELETE", f"/v1/subjects/{a[1]}")
-    elif a[0] == "stats":
+    cmd = a[0]
+    if cmd == "enroll" and len(a) >= 3:
+        out = call("PUT", f"/v1/subjects/{sid(a[1])}", {"fingers": [finger(x) for x in a[2:]]})
+    elif cmd == "add-finger" and len(a) == 4:
+        out = call("PUT", f"/v1/subjects/{sid(a[1])}/fingers/{int(a[3])}", finger(a[2]))
+    elif cmd == "identify" and len(a) >= 2:
+        out = call("POST", "/v1/identify", {"fingers": [finger(x) for x in a[1:]], "top_k": 5})
+    elif cmd == "verify" and len(a) >= 3:
+        out = call("POST", "/v1/verify", {"id": a[1], "fingers": [finger(x) for x in a[2:]]})
+    elif cmd == "get" and len(a) == 2:
+        out = call("GET", f"/v1/subjects/{sid(a[1])}")
+    elif cmd == "delete" and len(a) == 2:
+        out = call("DELETE", f"/v1/subjects/{sid(a[1])}")
+    elif cmd == "stats":
         out = call("GET", "/v1/stats")
     else:
         sys.exit(__doc__)

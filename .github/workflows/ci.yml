@@ -1,11 +1,17 @@
 name: CI
 on:
   push:
+    branches-ignore: [master, main]   # those run CI through deploy.yml
   pull_request:
+  workflow_call:                       # reused by deploy.yml as its test gate
+
+permissions:
+  contents: read
 
 jobs:
   build-test:
     strategy:
+      fail-fast: true
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
         build_type: [Release, Debug]
@@ -16,14 +22,16 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -Wno-dev
       - name: Build
         run: cmake --build build -j"$(nproc)"
-      - name: Unit + integration tests
+      - name: Unit, integration and REST API tests
         run: cd build && ctest --output-on-failure
       - name: Synthetic accuracy check
         if: matrix.build_type == 'Release'
         run: build/fpx eval --synthetic 20x3
-      - name: Speed smoke test (100k gallery)
+      - name: Speed smoke test (100k gallery, 1 and 2 fingers)
         if: matrix.build_type == 'Release'
-        run: build/fpx bench --gallery 100000 --probes 10
+        run: |
+          build/fpx bench --gallery 100000 --probes 10
+          build/fpx bench --gallery 50000 --probes 10 --fingers 2
 
   go-gateway:
     runs-on: ubuntu-24.04
@@ -32,3 +40,14 @@ jobs:
       - uses: actions/setup-go@v5
         with: { go-version: '1.22' }
       - run: cd examples/go-gateway && go vet ./... && go build ./...
+
+  deploy-scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck deploy script
+        run: shellcheck deploy/remote-deploy.sh
+      - name: validate production compose file
+        run: |
+          cd deploy && touch .env
+          FPX_IMAGE=example/image:tag docker compose -f docker-compose.prod.yml config -q

@@ -14,8 +14,9 @@ Fingerprint toolkit and identification server, independent of the scanner:
 > Status: v2 rewrite on branch `feature/identification-engine`. The matcher is
 > validated on synthetic data only; **calibrate thresholds on your own
 > scanner data before production** ([docs/MATCHING.md](docs/MATCHING.md#calibration)).
-> For million-scale 1:N, enrol **two fingers per customer**: single-finger
-> margins at 1 M are thin ([docs/SCALING.md](docs/SCALING.md)).
+> For million-scale 1:N, enrol and search **two fingers per customer**
+> (supported by the server and CLI); single-finger margins at 1 M are thin
+> ([docs/SCALING.md](docs/SCALING.md)).
 
 ---
 
@@ -79,9 +80,10 @@ build/fpx match scan.ansi other.bmp -v     # templates and/or images
 ### 4. 1:N identification
 
 ```bash
-build/fpx enroll   --db customers.fpxdb --id customer-001 scan.ansi
-build/fpx identify --db customers.fpxdb probe.bmp --top 5
-build/fpx bench --gallery 1000000          # 1 M synthetic customers: speed + accuracy
+# two fingers per customer: right index (2) and left index (7)
+build/fpx enroll   --db customers.fpxdb --id customer-001 r_index.ansi l_index.bmp --fingers 2,7
+build/fpx identify --db customers.fpxdb probe_r.bmp probe_l.bmp --fingers 2,7 --top 5
+build/fpx bench --gallery 1000000 --fingers 2   # 1 M synthetic customers x 2 fingers
 ```
 
 ### 5. Server
@@ -90,16 +92,34 @@ build/fpx bench --gallery 1000000          # 1 M synthetic customers: speed + ac
 FPX_API_KEY=change-me build/fpx-server --db customers.fpxdb --port 8080
 ```
 
+A *finger* in a request is `{"position": 1..10, "template": b64}` or
+`{"position": 1..10, "image": b64, "dpi"?: 500}`. Positions follow ISO 19794-2:
+1 right thumb, 2 right index, 3 right middle, 4 right ring, 5 right little,
+6–10 the same on the left hand, 0 = unknown.
+
 | Method | Path | Body (JSON, binary fields base64) | Result |
 |---|---|---|---|
 | GET | `/healthz` | | `{"status":"ok"}` |
-| GET | `/v1/stats` | | template count, memory, thresholds |
-| POST | `/v1/extract` | `{"image", "dpi"?, "format"?: "iso"\|"ansi", "wsq"?: true}` | `{"template", "minutiae", "wsq"?}` |
-| PUT | `/v1/subjects/{id}` | `{"template"}` or `{"image"}` | enrol / replace |
-| DELETE | `/v1/subjects/{id}` | | remove |
-| POST | `/v1/identify` | `{"template"\|"image", "top_k"?: 5}` | `{"match", "id", "candidates":[{id,score,match}], "elapsed_ms"}` |
-| POST | `/v1/verify` | `{"id", "template"\|"image"}` | `{"score", "match"}` |
+| GET | `/v1/stats` | | subjects, templates, memory, thresholds/policy |
+| POST | `/v1/extract` | `{"image", "dpi"?, "format"?: "iso"\|"ansi", "position"?, "wsq"?: true}` | `{"template", "minutiae", "wsq"?}` |
+| PUT | `/v1/subjects/{id}` | `{"fingers": [finger, ...]}` | enrol; the customer ends up with exactly these fingers |
+| PUT | `/v1/subjects/{id}/fingers/{pos}` | `{"template"}` or `{"image"}` | add / replace one finger |
+| GET | `/v1/subjects/{id}` | | `{"id", "fingers":[{position, minutiae}]}` |
+| DELETE | `/v1/subjects/{id}` · `/v1/subjects/{id}/fingers/{pos}` | | remove customer / one finger |
+| POST | `/v1/identify` | `{"fingers": [finger, ...], "top_k"?: 5}` | `{"match", "id", "candidates":[{id, score, match, fingers_matched, fingers:[{position, enrolled_position, score}]}], "elapsed_ms"}` |
+| POST | `/v1/verify` | `{"id", "fingers": [finger, ...]}` | `{"score", "match", "fingers_matched", "fingers"}` |
 | POST | `/v1/match` | `{"a", "b"}` (two templates) | `{"score", "match"}` |
+| POST | `/v1/admin/compact` | | rewrite the store without deleted/replaced records |
+
+Single-finger requests from v2.0 (`{"template": ...}` without `fingers`) still work.
+
+**Two-finger decision rule** (server flags in brackets): a customer matches when
+**both** presented fingers score ≥ 12 (`--finger-threshold`, `--min-fingers 2`),
+or one finger alone scores ≥ 30 (`--strong-single-threshold`, e.g. the other
+finger was smudged). With only one finger presented, the stricter
+single-finger rule applies: score ≥ 18 (`--identify-threshold`). Each probe
+finger is compared only with enrolled fingers of the same position, so two
+fingers cost two comparisons per customer, not four.
 
 All requests need `X-API-Key` when a key is set. Clients:
 `examples/python/client.py`, `examples/http/requests.http`.
@@ -116,6 +136,13 @@ docker run -p 8080:8080 -e FPX_API_KEY=change-me -v fpx-data:/data fp-extractor
 # sharded: 2 matcher shards + Go gateway on :9090
 docker compose -f docker/docker-compose.yml --profile sharded up --build
 ```
+
+### 7. Automatic deployment
+
+Every push to `master` runs all tests, builds the Docker image, publishes it to
+`ghcr.io/rabbicse/fp-extractor`, and deploys it over SSH to your server, with
+a health check and automatic rollback. Setup takes three GitHub settings and
+one SSH key: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
@@ -148,6 +175,7 @@ Full example: `examples/cpp/pipeline.cpp`.
 | [docs/MATCHING.md](docs/MATCHING.md) | the matching algorithm, calibration, improving accuracy |
 | [docs/SCALING.md](docs/SCALING.md) | 1 M+ identification: benchmarks, RAM, database choice, sharding |
 | [docs/TESTING.md](docs/TESTING.md) | step-by-step testing: unit tests, manual walk-through, accuracy eval, benchmarks |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | GitHub Actions auto-deployment (GHCR image, SSH deploy, health check, rollback), server setup |
 
 ## Repository layout
 
@@ -161,8 +189,23 @@ examples/           C++, Python (ctypes + REST), HTTP requests, Go sharding gate
 third_party/        NBIS WSQ subset (public domain)
 cmake/              dependency pinning (FingerJet, httplib, json, doctest)
 docker/             Dockerfile, docker-compose (single + sharded)
+deploy/             production compose file + remote deploy script (used by CI/CD)
 docs/               architecture, matching, scaling, testing
 ```
+
+## What's new in v2.1
+
+* **Two-finger (multi-finger) enrolment and search**: customers have up to
+  10 finger slots; identify/verify accept several fingers and fuse them per
+  customer. At 1 M customers × 2 fingers: 20/20 genuine accepted, 0 false
+  alarms, ~10 s per search on 4 cores. v2.0 single-template requests and
+  stores keep working unchanged.
+* Per-finger REST routes, `GET /v1/subjects/{id}`, online
+  `POST /v1/admin/compact`.
+* **Auto-deployment** (`.github/workflows/deploy.yml`): tests → Docker image
+  on GHCR → SSH deploy with health check and automatic rollback.
+* Fixed the Docker `HEALTHCHECK` (needs bash for `/dev/tcp`) and added
+  `.dockerignore`.
 
 ## What changed from v1
 

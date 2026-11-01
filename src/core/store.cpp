@@ -76,6 +76,29 @@ uint32_t crc32(const uint8_t* data, size_t n, uint32_t crc) {
     return ~crc;
 }
 
+std::string make_store_key(const std::string& subject, uint8_t finger) {
+    if (finger == 0) return subject;
+    return subject + '\x1F' + std::to_string(int(finger));
+}
+
+std::pair<std::string, uint8_t> split_store_key(const std::string& key) {
+    auto sep = key.rfind('\x1F');
+    if (sep == std::string::npos) return {key, uint8_t(0)};
+    const std::string pos = key.substr(sep + 1);
+    if (pos.empty() || pos.size() > 2 || pos.find_first_not_of("0123456789") != std::string::npos)
+        throw Error("store: malformed finger position in key");
+    const int f = std::stoi(pos);
+    if (f > 10) throw Error("store: finger position out of range in key");
+    return {key.substr(0, sep), uint8_t(f)};
+}
+
+bool valid_subject_id(const std::string& id) {
+    if (id.empty() || id.size() > 256) return false;
+    for (unsigned char c : id)
+        if (c < 0x20 || c == 0x7F) return false;
+    return true;
+}
+
 TemplateStore::TemplateStore(std::string path) : path_(std::move(path)) { open_append(); }
 
 TemplateStore::~TemplateStore() {

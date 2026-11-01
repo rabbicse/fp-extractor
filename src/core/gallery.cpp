@@ -7,7 +7,10 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
+
+#include "fpx/image.hpp"  // fpx::Error
 
 namespace fpx {
 
@@ -80,57 +83,115 @@ Gallery::Gallery(MatcherConfig cfg) : matcher_(cfg) {
 
 Gallery::~Gallery() = default;
 
+void Gallery::check_finger(uint8_t finger) {
+    if (finger > kMaxFingerPosition)
+        throw Error("finger position must be 0..10 (got " + std::to_string(int(finger)) + ")");
+}
+
 TemplateView Gallery::view_of(const Entry& e) const {
     return {minutiae_.data() + e.m_off, edges_.data() + e.e_off, e.n_m, e.n_e};
 }
 
-bool Gallery::insert_locked(const std::string& id, const CompiledTemplate& t) {
+int Gallery::subject_index(const std::string& subject) const {
+    auto it = subject_index_.find(subject);
+    return it == subject_index_.end() ? -1 : int(it->second);
+}
+
+bool Gallery::insert_locked(const std::string& subject, uint8_t finger, const CompiledTemplate& t) {
     if (t.minutiae.size() < 3) return false;
-    auto it = index_.find(id);
-    if (it != index_.end()) {
-        entries_[it->second].alive = false;
+    uint32_t sidx;
+    auto it = subject_index_.find(subject);
+    if (it == subject_index_.end()) {
+        sidx = uint32_t(subject_names_.size());
+        subject_names_.push_back(subject);
+        Slots empty;
+        empty.fill(-1);
+        slots_.push_back(empty);
+        subject_index_.emplace(subject, sidx);
+    } else {
+        sidx = it->second;
+    }
+    int32_t& slot = slots_[sidx][finger];
+    if (slot >= 0) {  // replace
+        entries_[size_t(slot)].alive = false;
         --live_;
     }
-    Entry e{minutiae_.size(), edges_.size(), uint16_t(t.minutiae.size()), uint16_t(t.edges.size()), true};
+    Entry e{minutiae_.size(), edges_.size(), sidx, uint16_t(t.minutiae.size()), uint16_t(t.edges.size()), finger, true};
     minutiae_.insert(minutiae_.end(), t.minutiae.begin(), t.minutiae.end());
     edges_.insert(edges_.end(), t.edges.begin(), t.edges.end());
-    const uint32_t idx = uint32_t(entries_.size());
+    slot = int32_t(entries_.size());
     entries_.push_back(e);
-    if (it != index_.end()) {
-        ids_.push_back(id);
-        it->second = idx;
-    } else {
-        ids_.push_back(id);
-        index_.emplace(id, idx);
-    }
     ++live_;
     return true;
 }
 
-bool Gallery::insert(const std::string& id, const FingerTemplate& t) {
+bool Gallery::insert(const std::string& subject, uint8_t finger, const FingerTemplate& t) {
+    check_finger(finger);
     CompiledTemplate ct = compile(t, matcher_.config());  // outside the lock
     std::unique_lock<std::shared_mutex> lk(mu_);
-    return insert_locked(id, ct);
+    return insert_locked(subject, finger, ct);
 }
 
-bool Gallery::insert(const std::string& id, const CompiledTemplate& t) {
+bool Gallery::insert(const std::string& subject, uint8_t finger, const CompiledTemplate& t) {
+    check_finger(finger);
     std::unique_lock<std::shared_mutex> lk(mu_);
-    return insert_locked(id, t);
+    return insert_locked(subject, finger, t);
 }
 
-bool Gallery::remove(const std::string& id) {
+bool Gallery::remove(const std::string& subject, uint8_t finger) {
+    check_finger(finger);
     std::unique_lock<std::shared_mutex> lk(mu_);
-    auto it = index_.find(id);
-    if (it == index_.end()) return false;
-    entries_[it->second].alive = false;
-    index_.erase(it);
+    int s = subject_index(subject);
+    if (s < 0) return false;
+    int32_t& slot = slots_[size_t(s)][finger];
+    if (slot < 0) return false;
+    entries_[size_t(slot)].alive = false;
+    slot = -1;
     --live_;
     return true;
 }
 
-bool Gallery::contains(const std::string& id) const {
+size_t Gallery::remove_subject(const std::string& subject) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    int s = subject_index(subject);
+    if (s < 0) return 0;
+    size_t n = 0;
+    for (int32_t& slot : slots_[size_t(s)]) {
+        if (slot < 0) continue;
+        entries_[size_t(slot)].alive = false;
+        slot = -1;
+        --live_;
+        ++n;
+    }
+    return n;
+}
+
+bool Gallery::contains(const std::string& subject) const {
     std::shared_lock<std::shared_mutex> lk(mu_);
-    return index_.count(id) != 0;
+    int s = subject_index(subject);
+    if (s < 0) return false;
+    for (int32_t slot : slots_[size_t(s)])
+        if (slot >= 0) return true;
+    return false;
+}
+
+bool Gallery::contains(const std::string& subject, uint8_t finger) const {
+    if (finger > kMaxFingerPosition) return false;
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    int s = subject_index(subject);
+    return s >= 0 && slots_[size_t(s)][finger] >= 0;
+}
+
+std::vector<std::pair<uint8_t, int>> Gallery::fingers_of(const std::string& subject) const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    std::vector<std::pair<uint8_t, int>> out;
+    int s = subject_index(subject);
+    if (s < 0) return out;
+    for (int f = 0; f <= kMaxFingerPosition; ++f) {
+        int32_t slot = slots_[size_t(s)][size_t(f)];
+        if (slot >= 0) out.emplace_back(uint8_t(f), int(entries_[size_t(slot)].n_m));
+    }
+    return out;
 }
 
 size_t Gallery::size() const {
@@ -138,12 +199,25 @@ size_t Gallery::size() const {
     return live_;
 }
 
+size_t Gallery::subjects() const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    size_t n = 0;
+    for (const Slots& sl : slots_)
+        for (int32_t slot : sl)
+            if (slot >= 0) {
+                ++n;
+                break;
+            }
+    return n;
+}
+
 size_t Gallery::memory_bytes() const {
     std::shared_lock<std::shared_mutex> lk(mu_);
-    size_t ids = 0;
-    for (const auto& s : ids_) ids += s.capacity() + sizeof(std::string);
+    size_t names = 0;
+    for (const auto& s : subject_names_) names += s.capacity() + sizeof(std::string);
     return minutiae_.capacity() * sizeof(CMinutia) + edges_.capacity() * sizeof(CEdge) +
-           entries_.capacity() * sizeof(Entry) + ids + index_.size() * (sizeof(std::string) + 32);
+           entries_.capacity() * sizeof(Entry) + slots_.capacity() * sizeof(Slots) + names +
+           subject_index_.size() * (sizeof(std::string) + 32);
 }
 
 void Gallery::reserve(size_t templates, size_t avg_minutiae) {
@@ -151,8 +225,9 @@ void Gallery::reserve(size_t templates, size_t avg_minutiae) {
     minutiae_.reserve(templates * avg_minutiae);
     edges_.reserve(templates * avg_minutiae * size_t(std::max(1, matcher_.config().neighbors)));
     entries_.reserve(templates);
-    ids_.reserve(templates);
-    index_.reserve(templates);
+    subject_names_.reserve(templates);
+    slots_.reserve(templates);
+    subject_index_.reserve(templates);
 }
 
 void Gallery::compact() {
@@ -160,28 +235,43 @@ void Gallery::compact() {
     std::vector<CMinutia> m;
     std::vector<CEdge> e;
     std::vector<Entry> en;
-    std::vector<std::string> ids;
+    std::vector<std::string> names;
+    std::vector<Slots> slots;
     m.reserve(minutiae_.size());
     e.reserve(edges_.size());
     en.reserve(live_);
-    ids.reserve(live_);
-    index_.clear();
-    for (size_t i = 0; i < entries_.size(); ++i) {
-        const Entry& x = entries_[i];
-        if (!x.alive) continue;
-        Entry y{m.size(), e.size(), x.n_m, x.n_e, true};
-        m.insert(m.end(), minutiae_.begin() + x.m_off, minutiae_.begin() + x.m_off + x.n_m);
-        e.insert(e.end(), edges_.begin() + x.e_off, edges_.begin() + x.e_off + x.n_e);
-        index_.emplace(ids_[i], uint32_t(en.size()));
-        en.push_back(y);
-        ids.push_back(std::move(ids_[i]));
+    subject_index_.clear();
+    for (size_t s = 0; s < subject_names_.size(); ++s) {
+        Slots ns;
+        ns.fill(-1);
+        bool any = false;
+        const uint32_t new_sidx = uint32_t(names.size());
+        for (size_t f = 0; f < ns.size(); ++f) {
+            int32_t slot = slots_[s][f];
+            if (slot < 0) continue;
+            const Entry& x = entries_[size_t(slot)];
+            Entry y{m.size(), e.size(), new_sidx, x.n_m, x.n_e, x.finger, true};
+            m.insert(m.end(), minutiae_.begin() + long(x.m_off), minutiae_.begin() + long(x.m_off + x.n_m));
+            e.insert(e.end(), edges_.begin() + long(x.e_off), edges_.begin() + long(x.e_off + x.n_e));
+            ns[f] = int32_t(en.size());
+            en.push_back(y);
+            any = true;
+        }
+        if (!any) continue;  // subject without fingers disappears
+        subject_index_.emplace(subject_names_[s], new_sidx);
+        names.push_back(std::move(subject_names_[s]));
+        slots.push_back(ns);
     }
     minutiae_.swap(m);
     edges_.swap(e);
     entries_.swap(en);
-    ids_.swap(ids);
+    subject_names_.swap(names);
+    slots_.swap(slots);
 }
 
+// ---------------------------------------------------------------------------
+// Single-template identification
+// ---------------------------------------------------------------------------
 IdentifyResult Gallery::identify(const FingerTemplate& probe, const IdentifyOptions& opt) const {
     Probe p(probe, matcher_.config());
     return identify(p, opt);
@@ -200,15 +290,14 @@ IdentifyResult Gallery::identify(const Probe& probe, const IdentifyOptions& opt)
         uint32_t idx;
     };
     auto worse = [](const Hit& a, const Hit& b) { return a.score > b.score; };  // min-heap on score
-    std::vector<std::vector<Hit>> local(threads);
-    std::vector<uint64_t> counts(threads, 0);
-    // Dynamic chunking: good load balance even with uneven template sizes.
-    const size_t chunk = 4096;
+    std::vector<std::vector<Hit>> local{size_t(threads)};
+    std::vector<uint64_t> counts(size_t(threads), 0);
+    const size_t chunk = 4096;  // dynamic chunking -> good load balance
     std::atomic<size_t> next{0};
 
     pool_->run(threads, [&](int w) {
-        std::vector<Hit>& heap = local[w];
-        heap.reserve(top_k + 1);
+        std::vector<Hit>& heap = local[size_t(w)];
+        heap.reserve(size_t(top_k) + 1);
         uint64_t cnt = 0;
         for (;;) {
             size_t begin = next.fetch_add(chunk);
@@ -230,25 +319,190 @@ IdentifyResult Gallery::identify(const Probe& probe, const IdentifyOptions& opt)
                 }
             }
         }
-        counts[w] = cnt;
+        counts[size_t(w)] = cnt;
     });
 
     std::vector<Hit> all;
     for (auto& h : local) all.insert(all.end(), h.begin(), h.end());
     std::sort(all.begin(), all.end(), [](const Hit& a, const Hit& b) { return a.score > b.score; });
-    if (int(all.size()) > top_k) all.resize(top_k);
-    for (const Hit& h : all) res.candidates.push_back({ids_[h.idx], h.score});
+    if (int(all.size()) > top_k) all.resize(size_t(top_k));
+    for (const Hit& h : all) {
+        const Entry& e = entries_[h.idx];
+        res.candidates.push_back({subject_names_[e.subject], h.score, e.finger});
+    }
     for (uint64_t c : counts) res.compared += c;
     res.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return res;
 }
 
-std::optional<float> Gallery::verify(const std::string& id, const FingerTemplate& probe) const {
+// ---------------------------------------------------------------------------
+// Multi-finger identification
+// ---------------------------------------------------------------------------
+void apply_policy(SubjectCandidate& c, size_t presented, const FusionPolicy& p) {
+    c.score = 0;
+    c.fingers_matched = 0;
+    float best = 0;
+    for (const FingerScore& f : c.fingers) {
+        c.score += f.score;
+        best = std::max(best, f.score);
+        if (f.score >= p.finger_threshold) ++c.fingers_matched;
+    }
+    if (presented <= 1) {
+        c.match = best >= p.single_threshold;
+    } else {
+        const int need = std::max(1, std::min(p.min_fingers, int(presented)));
+        c.match = c.fingers_matched >= need || (p.strong_single_threshold > 0 && best >= p.strong_single_threshold);
+    }
+}
+
+namespace {
+
+inline bool positions_compatible(uint8_t probe_finger, uint8_t gallery_finger) {
+    return probe_finger == 0 || gallery_finger == 0 || probe_finger == gallery_finger;
+}
+
+struct SubjectHit {
+    uint32_t subject;
+    float score;
+    uint8_t probe;           // index into probes
+    uint8_t gallery_finger;
+};
+
+// Best one-to-one assignment of probe fingers to gallery fingers for one
+// subject (greedy by score; at most 10 x 11 candidates).
+void assign(std::vector<SubjectHit>::iterator b, std::vector<SubjectHit>::iterator e,
+            const std::vector<FingerProbe>& probes, std::vector<FingerScore>& out) {
+    std::sort(b, e, [](const SubjectHit& x, const SubjectHit& y) { return x.score > y.score; });
+    uint32_t used_probe = 0, used_gallery = 0;
+    for (auto it = b; it != e; ++it) {
+        if ((used_probe >> it->probe) & 1u) continue;
+        if ((used_gallery >> it->gallery_finger) & 1u) continue;
+        used_probe |= 1u << it->probe;
+        used_gallery |= 1u << it->gallery_finger;
+        out.push_back({probes[it->probe].finger, it->gallery_finger, it->score});
+    }
+}
+
+}  // namespace
+
+SubjectIdentifyResult Gallery::identify_subjects(const std::vector<FingerProbe>& probes,
+                                                 const SubjectIdentifyOptions& opt) const {
+    const auto t0 = std::chrono::steady_clock::now();
+    SubjectIdentifyResult res;
+    if (probes.empty()) throw Error("identify: at least one probe finger is required");
+    if (probes.size() > size_t(kMaxFingerPosition)) throw Error("identify: at most 10 probe fingers");
+    for (const auto& p : probes) check_finger(p.finger);
+
+    std::vector<Probe> compiled;
+    compiled.reserve(probes.size());
+    for (const auto& p : probes) compiled.emplace_back(p.tmpl, matcher_.config());
+
+    // Scores below this cannot influence any decision; dropping them keeps
+    // the per-thread hit lists tiny (impostor scores are almost always ~0).
+    const float floor = std::max(0.5f, 0.25f * std::min(opt.policy.finger_threshold, opt.policy.single_threshold));
+
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    const size_t n = entries_.size();
+    const int threads = std::max(1, opt.threads > 0 ? std::min(opt.threads, pool_->size()) : pool_->size());
+    std::vector<std::vector<SubjectHit>> local{size_t(threads)};
+    std::vector<uint64_t> counts(size_t(threads), 0);
+    const size_t chunk = 4096;
+    std::atomic<size_t> next{0};
+
+    // One pass over the gallery; every entry is compared with each probe
+    // finger whose position is compatible.
+    pool_->run(threads, [&](int w) {
+        auto& hits = local[size_t(w)];
+        uint64_t cnt = 0;
+        for (;;) {
+            size_t begin = next.fetch_add(chunk);
+            if (begin >= n) break;
+            size_t end = std::min(n, begin + chunk);
+            for (size_t i = begin; i < end; ++i) {
+                const Entry& e = entries_[i];
+                if (!e.alive) continue;
+                const TemplateView v = view_of(e);
+                for (size_t p = 0; p < probes.size(); ++p) {
+                    if (!positions_compatible(probes[p].finger, e.finger)) continue;
+                    ++cnt;
+                    float s = matcher_.match(compiled[p], v);
+                    if (s >= floor) hits.push_back({e.subject, s, uint8_t(p), e.finger});
+                }
+            }
+        }
+        counts[size_t(w)] = cnt;
+    });
+
+    std::vector<SubjectHit> all;
+    for (auto& h : local) all.insert(all.end(), h.begin(), h.end());
+    std::sort(all.begin(), all.end(), [](const SubjectHit& a, const SubjectHit& b) { return a.subject < b.subject; });
+    std::vector<SubjectCandidate> cands;
+    for (size_t i = 0; i < all.size();) {
+        size_t j = i;
+        while (j < all.size() && all[j].subject == all[i].subject) ++j;
+        SubjectCandidate c;
+        c.id = subject_names_[all[i].subject];
+        assign(all.begin() + long(i), all.begin() + long(j), probes, c.fingers);
+        apply_policy(c, probes.size(), opt.policy);
+        cands.push_back(std::move(c));
+        i = j;
+    }
+    std::sort(cands.begin(), cands.end(), [](const SubjectCandidate& a, const SubjectCandidate& b) {
+        if (a.match != b.match) return a.match;
+        return a.score > b.score;
+    });
+    if (cands.size() > size_t(std::max(1, opt.top_k))) cands.resize(size_t(std::max(1, opt.top_k)));
+    res.candidates = std::move(cands);
+    for (uint64_t c : counts) res.compared += c;
+    res.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+std::optional<float> Gallery::verify(const std::string& subject, const FingerTemplate& probe) const {
     Probe p(probe, matcher_.config());
     std::shared_lock<std::shared_mutex> lk(mu_);
-    auto it = index_.find(id);
-    if (it == index_.end()) return std::nullopt;
-    return matcher_.match(p, view_of(entries_[it->second]));
+    int s = subject_index(subject);
+    if (s < 0) return std::nullopt;
+    std::optional<float> best;
+    for (int32_t slot : slots_[size_t(s)]) {
+        if (slot < 0) continue;
+        float sc = matcher_.match(p, view_of(entries_[size_t(slot)]));
+        if (!best || sc > *best) best = sc;
+    }
+    return best;
+}
+
+std::optional<SubjectCandidate> Gallery::verify_subject(const std::string& subject,
+                                                        const std::vector<FingerProbe>& probes,
+                                                        const FusionPolicy& policy) const {
+    if (probes.empty()) throw Error("verify: at least one probe finger is required");
+    if (probes.size() > size_t(kMaxFingerPosition)) throw Error("verify: at most 10 probe fingers");
+    for (const auto& p : probes) check_finger(p.finger);
+    std::vector<Probe> compiled;
+    for (const auto& p : probes) compiled.emplace_back(p.tmpl, matcher_.config());
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    int s = subject_index(subject);
+    if (s < 0) return std::nullopt;
+    std::vector<SubjectHit> hits;
+    bool any = false;
+    for (int32_t slot : slots_[size_t(s)]) {
+        if (slot < 0) continue;
+        any = true;
+        const Entry& e = entries_[size_t(slot)];
+        for (size_t p = 0; p < probes.size(); ++p) {
+            if (!positions_compatible(probes[p].finger, e.finger)) continue;
+            hits.push_back({uint32_t(s), matcher_.match(compiled[p], view_of(e)), uint8_t(p), e.finger});
+        }
+    }
+    if (!any) return std::nullopt;
+    SubjectCandidate c;
+    c.id = subject;
+    assign(hits.begin(), hits.end(), probes, c.fingers);
+    apply_policy(c, probes.size(), policy);
+    return c;
 }
 
 }  // namespace fpx

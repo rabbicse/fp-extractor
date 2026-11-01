@@ -1,0 +1,11 @@
+# Keep the build context small and free of local artefacts / data.
+.git
+build/
+build-*/
+cmake-build-*/
+**/*.fpxdb
+**/*.fpxdb.compact
+fpx-demo/
+data/
+.idea/
+.vscode/

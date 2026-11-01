@@ -9,8 +9,10 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <filesystem>
 #include <cstdio>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -83,14 +85,22 @@ struct Config {
     int http_threads = 8;
     std::string api_key;  // empty = no auth
     float verify_threshold = kVerifyThreshold;
-    float identify_threshold = kIdentifyThreshold;
+    float identify_threshold = kIdentifyThreshold;  // one finger presented (1:N)
+    float finger_threshold = kVerifyThreshold;      // per finger when >= 2 presented
+    int min_fingers = 2;
+    float strong_single_threshold = 30.0f;
     int default_dpi = 500;
 };
 
 void usage() {
     std::puts(
-        "fpx-server [--db gallery.fpxdb] [--host 0.0.0.0] [--port 8080] [--threads N]\n"
-        "           [--http-threads 8] [--api-key KEY] [--verify-threshold 12] [--identify-threshold 18]\n"
+        "fpx-server [--db gallery.fpxdb] [--host 0.0.0.0] [--port 8080] [--threads N] [--http-threads 8]\n"
+        "           [--api-key KEY]\n"
+        "           [--verify-threshold 12]       1:1, one finger\n"
+        "           [--identify-threshold 18]     1:N, one finger presented\n"
+        "           [--finger-threshold 12]       1:N/1:1, per finger when two or more are presented\n"
+        "           [--min-fingers 2]             fingers that must reach --finger-threshold\n"
+        "           [--strong-single-threshold 30] one finger alone this strong also matches (0 = off)\n"
         "Environment: FPX_API_KEY overrides --api-key.");
 }
 
@@ -98,63 +108,165 @@ struct Error400 : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// One finger of a request after decoding: position + parsed template + raw record.
+struct InFinger {
+    uint8_t position = 0;
+    FingerTemplate tmpl;
+    std::vector<uint8_t> record;
+};
+
+json policy_json(const FusionPolicy& p) {
+    return {{"finger_threshold", p.finger_threshold},
+            {"min_fingers", p.min_fingers},
+            {"single_threshold", p.single_threshold},
+            {"strong_single_threshold", p.strong_single_threshold}};
+}
+
+json candidate_json(const SubjectCandidate& c) {
+    json fingers = json::array();
+    for (const auto& f : c.fingers)
+        fingers.push_back({{"position", f.probe_finger}, {"enrolled_position", f.gallery_finger}, {"score", f.score}});
+    return {{"id", c.id},
+            {"score", c.score},
+            {"match", c.match},
+            {"fingers_matched", c.fingers_matched},
+            {"fingers", fingers}};
+}
+
 class Service {
 public:
     explicit Service(const Config& cfg) : cfg_(cfg), store_(cfg.db), gallery_() {
+        policy_.finger_threshold = cfg.finger_threshold;
+        policy_.min_fingers = cfg.min_fingers;
+        policy_.single_threshold = cfg.identify_threshold;
+        policy_.strong_single_threshold = cfg.strong_single_threshold;
+        verify_policy_ = policy_;
+        verify_policy_.single_threshold = cfg.verify_threshold;
+
         auto t0 = std::chrono::steady_clock::now();
         std::string warn;
         size_t bad = 0;
         store_.replay(
-            [&](const std::string& id, const std::vector<uint8_t>& rec) {
+            [&](const std::string& key, const std::vector<uint8_t>& rec) {
                 try {
-                    gallery_.insert(id, parse_template(rec));
+                    auto [subject, finger] = split_store_key(key);
+                    gallery_.insert(subject, finger, parse_template(rec));
                 } catch (const std::exception&) {
                     ++bad;
                 }
             },
-            [&](const std::string& id) { gallery_.remove(id); }, &warn);
+            [&](const std::string& key) {
+                try {
+                    auto [subject, finger] = split_store_key(key);
+                    gallery_.remove(subject, finger);
+                } catch (const std::exception&) {
+                    ++bad;
+                }
+            },
+            &warn);
         gallery_.compact();
         if (!warn.empty()) std::fprintf(stderr, "warning: %s\n", warn.c_str());
-        if (bad) std::fprintf(stderr, "warning: %zu undecodable templates skipped\n", bad);
+        if (bad) std::fprintf(stderr, "warning: %zu undecodable store records skipped\n", bad);
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "loaded %zu templates from %s in %.0f ms (%.0f MB)\n", gallery_.size(), cfg.db.c_str(), ms,
-                     gallery_.memory_bytes() / 1048576.0);
+        std::fprintf(stderr, "loaded %zu subjects / %zu finger templates from %s in %.0f ms (%.0f MB)\n",
+                     gallery_.subjects(), gallery_.size(), cfg.db.c_str(), ms, gallery_.memory_bytes() / 1048576.0);
     }
 
-    // Template from {"template": b64} or {"image": b64, "dpi": N}.
-    std::pair<FingerTemplate, std::vector<uint8_t>> template_from(const json& j, const char* tkey = "template",
-                                                                  const char* ikey = "image") {
+    // --- request decoding ------------------------------------------------
+    static uint8_t parse_position(const json& j, uint8_t fallback) {
+        const char* key = j.contains("position") ? "position" : j.contains("finger") ? "finger" : nullptr;
+        if (!key) return fallback;
+        if (!j[key].is_number_integer()) throw Error400("finger position must be an integer 0..10");
+        int p = j[key].get<int>();
+        if (p < 0 || p > kMaxFingerPosition) throw Error400("finger position must be 0..10");
+        return uint8_t(p);
+    }
+
+    // One finger from {"template": b64} or {"image": b64, "dpi": N}; position
+    // from "position"/"finger", else `default_position`, else the template header.
+    InFinger finger_from(const json& j, int default_position = -1, const char* tkey = "template",
+                         const char* ikey = "image") {
+        if (!j.is_object()) throw Error400("each finger must be a JSON object");
+        InFinger f;
         if (j.contains(tkey)) {
-            auto bytes = b64decode(j.at(tkey).get<std::string>());
+            f.record = b64decode(j.at(tkey).get<std::string>());
             try {
-                return {parse_template(bytes), bytes};
+                f.tmpl = parse_template(f.record);
             } catch (const Error& e) {
                 throw Error400(std::string("bad template: ") + e.what());
             }
-        }
-        if (j.contains(ikey)) {
+        } else if (j.contains(ikey)) {
             auto bytes = b64decode(j.at(ikey).get<std::string>());
             try {
                 auto img = decode_image(bytes, j.value("dpi", cfg_.default_dpi));
                 if (j.contains("dpi")) img.dpi = j["dpi"].get<int>();
                 ExtractOptions o;
                 o.format = parse_template_format(j.value("format", std::string("iso")));
+                o.finger_position = parse_position(j, default_position > 0 ? uint8_t(default_position) : 0);
                 auto r = extract(img, o);
-                return {r.parsed, r.record};
+                f.tmpl = r.parsed;
+                f.record = r.record;
+            } catch (const Error400&) {
+                throw;
             } catch (const Error& e) {
                 throw Error400(std::string("bad image: ") + e.what());
             }
+        } else {
+            throw Error400(std::string("finger needs '") + tkey + "' (base64 ANSI/ISO template) or '" + ikey +
+                           "' (base64 BMP/PGM/TIFF/WSQ)");
         }
-        throw Error400(std::string("request needs '") + tkey + "' (base64 ANSI/ISO template) or '" + ikey +
-                       "' (base64 BMP/PGM/TIFF/WSQ)");
+        const uint8_t header_pos = f.tmpl.finger_position <= kMaxFingerPosition ? f.tmpl.finger_position : 0;
+        f.position = parse_position(j, default_position >= 0 ? uint8_t(default_position) : header_pos);
+        return f;
     }
 
+    // {"fingers": [...]} or a single legacy {"template"|"image", "position"?}.
+    std::vector<InFinger> fingers_from(const json& j) {
+        std::vector<InFinger> out;
+        if (j.contains("fingers")) {
+            const json& arr = j["fingers"];
+            if (!arr.is_array() || arr.empty()) throw Error400("'fingers' must be a non-empty array");
+            if (arr.size() > size_t(kMaxFingerPosition)) throw Error400("at most 10 fingers per request");
+            for (const auto& f : arr) out.push_back(finger_from(f));
+        } else {
+            out.push_back(finger_from(j));
+        }
+        uint32_t seen = 0;
+        for (const auto& f : out) {
+            if ((seen >> f.position) & 1u)
+                throw Error400("finger position " + std::to_string(f.position) + " given twice" +
+                               (f.position == 0 ? " (set \"position\" 1..10 when sending several fingers)" : ""));
+            seen |= 1u << f.position;
+        }
+        return out;
+    }
+
+    static std::vector<FingerProbe> probes_of(const std::vector<InFinger>& in) {
+        std::vector<FingerProbe> p;
+        for (const auto& f : in) p.push_back({f.position, f.tmpl});
+        return p;
+    }
+
+    void check_enrolable(const std::vector<InFinger>& fingers) {
+        for (const auto& f : fingers)
+            if (f.tmpl.minutiae.size() < 6)
+                throw Error400("finger " + std::to_string(f.position) + ": too few minutiae (" +
+                               std::to_string(f.tmpl.minutiae.size()) + "), please re-scan");
+    }
+
+    static void check_id(const std::string& id) {
+        if (!valid_subject_id(id)) throw Error400("id must be 1..256 characters without control characters");
+    }
+
+    // --- endpoints ---------------------------------------------------------
     json stats() const {
         return {{"version", FPX_VERSION_STRING},
+                {"subjects", gallery_.subjects()},
                 {"templates", gallery_.size()},
                 {"memory_mb", gallery_.memory_bytes() / 1048576.0},
                 {"verify_threshold", cfg_.verify_threshold},
                 {"identify_threshold", cfg_.identify_threshold},
+                {"policy", policy_json(policy_)},
                 {"match_threads", cfg_.match_threads > 0 ? cfg_.match_threads : int(std::thread::hardware_concurrency())},
                 {"matcher", to_string(gallery_.matcher().config())}};
     }
@@ -171,7 +283,7 @@ public:
         if (j.contains("dpi")) img.dpi = j["dpi"].get<int>();
         ExtractOptions o;
         o.format = parse_template_format(j.value("format", std::string("iso")));
-        o.finger_position = uint8_t(j.value("finger_position", 0));
+        o.finger_position = parse_position(j, 0);
         ExtractResult r;
         try {
             r = extract(img, o);
@@ -180,6 +292,7 @@ public:
         }
         json out = {{"template", b64encode(r.record)},
                     {"format", to_string(o.format)},
+                    {"position", o.finger_position},
                     {"minutiae", r.parsed.minutiae.size()},
                     {"width", img.width},
                     {"height", img.height},
@@ -188,57 +301,126 @@ public:
         return out;
     }
 
-    json enroll(const std::string& id, const json& j) {
-        if (id.empty() || id.size() > 256) throw Error400("id must be 1..256 characters");
-        auto [t, rec] = template_from(j);
-        if (t.minutiae.size() < 6) throw Error400("template has too few minutiae (" + std::to_string(t.minutiae.size()) + ")");
-        bool replaced = gallery_.contains(id);
-        store_.put(id, rec);  // durable first, then visible
-        gallery_.insert(id, t);
-        return {{"id", id}, {"minutiae", t.minutiae.size()}, {"replaced", replaced}};
+    json subject_json(const std::string& id) const {
+        json fingers = json::array();
+        for (auto& [pos, nm] : gallery_.fingers_of(id)) fingers.push_back({{"position", pos}, {"minutiae", nm}});
+        return {{"id", id}, {"fingers", fingers}};
     }
 
-    bool remove(const std::string& id) {
-        if (!gallery_.contains(id)) return false;
-        store_.erase(id);
-        gallery_.remove(id);
+    std::optional<json> get_subject(const std::string& id) const {
+        if (!gallery_.contains(id)) return std::nullopt;
+        return subject_json(id);
+    }
+
+    // PUT /v1/subjects/{id}: the subject ends up with exactly these fingers.
+    json put_subject(const std::string& id, const json& j, bool& created) {
+        check_id(id);
+        auto fingers = fingers_from(j);  // decode/extract outside the lock
+        check_enrolable(fingers);
+        std::lock_guard<std::mutex> lk(write_mu_);
+        created = !gallery_.contains(id);
+        uint32_t keep = 0;
+        for (const auto& f : fingers) keep |= 1u << f.position;
+        for (auto& [pos, nm] : gallery_.fingers_of(id)) {
+            if ((keep >> pos) & 1u) continue;
+            store_.erase(make_store_key(id, pos));
+            gallery_.remove(id, pos);
+        }
+        for (const auto& f : fingers) {
+            store_.put(make_store_key(id, f.position), f.record);  // durable first, then visible
+            gallery_.insert(id, f.position, f.tmpl);
+        }
+        return subject_json(id);
+    }
+
+    // PUT /v1/subjects/{id}/fingers/{pos}: add or replace one finger.
+    json put_finger(const std::string& id, int pos, const json& j, bool& created) {
+        check_id(id);
+        if (pos < 0 || pos > kMaxFingerPosition) throw Error400("finger position must be 0..10");
+        InFinger f = finger_from(j, pos);
+        f.position = uint8_t(pos);  // the URL is authoritative
+        check_enrolable({f});
+        std::lock_guard<std::mutex> lk(write_mu_);
+        created = !gallery_.contains(id, f.position);
+        store_.put(make_store_key(id, f.position), f.record);
+        gallery_.insert(id, f.position, f.tmpl);
+        return subject_json(id);
+    }
+
+    bool delete_subject(const std::string& id) {
+        std::lock_guard<std::mutex> lk(write_mu_);
+        auto fingers = gallery_.fingers_of(id);
+        if (fingers.empty()) return false;
+        for (auto& [pos, nm] : fingers) store_.erase(make_store_key(id, pos));
+        gallery_.remove_subject(id);
         return true;
     }
 
-    json verify(const json& j) {
-        if (!j.contains("id")) throw Error400("'id' is required");
-        const std::string id = j["id"].get<std::string>();
-        auto [t, rec] = template_from(j);
-        auto s = gallery_.verify(id, t);
-        if (!s) return nullptr;
-        const float thr = j.value("threshold", cfg_.verify_threshold);
-        return {{"id", id}, {"score", *s}, {"threshold", thr}, {"match", *s >= thr}};
+    bool delete_finger(const std::string& id, int pos) {
+        if (pos < 0 || pos > kMaxFingerPosition) throw Error400("finger position must be 0..10");
+        std::lock_guard<std::mutex> lk(write_mu_);
+        if (!gallery_.contains(id, uint8_t(pos))) return false;
+        store_.erase(make_store_key(id, uint8_t(pos)));
+        gallery_.remove(id, uint8_t(pos));
+        return true;
     }
 
     json identify(const json& j) {
-        auto [t, rec] = template_from(j);
-        IdentifyOptions o;
+        auto fingers = fingers_from(j);
+        SubjectIdentifyOptions o;
         o.top_k = std::clamp(j.value("top_k", 5), 1, 100);
         o.threads = cfg_.match_threads;
-        const float thr = j.value("threshold", cfg_.identify_threshold);
-        auto r = gallery_.identify(t, o);
+        o.policy = policy_;
+        if (fingers.size() == 1 && j.contains("threshold")) o.policy.single_threshold = j["threshold"].get<float>();
+        auto r = gallery_.identify_subjects(probes_of(fingers), o);
         json cands = json::array();
-        for (auto& c : r.candidates) cands.push_back({{"id", c.id}, {"score", c.score}, {"match", c.score >= thr}});
-        const bool hit = !r.candidates.empty() && r.candidates[0].score >= thr;
+        for (auto& c : r.candidates) cands.push_back(candidate_json(c));
+        const bool hit = !r.candidates.empty() && r.candidates[0].match;
         return {{"match", hit},
                 {"id", hit ? json(r.candidates[0].id) : json(nullptr)},
-                {"threshold", thr},
+                {"fingers_presented", fingers.size()},
+                {"threshold", fingers.size() == 1 ? o.policy.single_threshold : o.policy.finger_threshold},
+                {"policy", policy_json(o.policy)},
                 {"candidates", cands},
                 {"compared", r.compared},
                 {"elapsed_ms", r.elapsed_ms}};
     }
 
+    std::optional<json> verify(const json& j) {
+        if (!j.contains("id")) throw Error400("'id' is required");
+        const std::string id = j["id"].get<std::string>();
+        auto fingers = fingers_from(j);
+        FusionPolicy p = verify_policy_;
+        if (fingers.size() == 1 && j.contains("threshold")) p.single_threshold = j["threshold"].get<float>();
+        auto c = gallery_.verify_subject(id, probes_of(fingers), p);
+        if (!c) return std::nullopt;
+        json out = candidate_json(*c);
+        out["fingers_presented"] = fingers.size();
+        out["threshold"] = fingers.size() == 1 ? p.single_threshold : p.finger_threshold;
+        out["policy"] = policy_json(p);
+        return out;
+    }
+
     json match(const json& j) {
-        auto a = template_from(j, "a", "a_image").first;
-        auto b = template_from(j, "b", "b_image").first;
+        auto a = finger_from(j, -1, "a", "a_image").tmpl;
+        auto b = finger_from(j, -1, "b", "b_image").tmpl;
         float s = gallery_.matcher().match(a, b);
         const float thr = j.value("threshold", cfg_.verify_threshold);
         return {{"score", s}, {"threshold", thr}, {"match", s >= thr}};
+    }
+
+    // Rewrite the store with live records only and repack the gallery. Done
+    // inside the server so the open store file is swapped safely.
+    json compact() {
+        std::lock_guard<std::mutex> lk(write_mu_);
+        const std::string path = cfg_.db;
+        auto before = std::filesystem::file_size(path);
+        auto t0 = std::chrono::steady_clock::now();
+        store_.compact();
+        gallery_.compact();
+        auto after = std::filesystem::file_size(path);
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return {{"bytes_before", before}, {"bytes_after", after}, {"elapsed_ms", ms}};
     }
 
     void flush() { store_.sync(); }
@@ -248,6 +430,8 @@ private:
     Config cfg_;
     TemplateStore store_;
     Gallery gallery_;
+    FusionPolicy policy_, verify_policy_;
+    std::mutex write_mu_;  // serialises enrol/delete so store and gallery stay in step
 };
 
 httplib::Server* g_server = nullptr;
@@ -276,6 +460,9 @@ int main(int argc, char** argv) {
         else if (a == "--api-key") cfg.api_key = next();
         else if (a == "--verify-threshold") cfg.verify_threshold = std::stof(next());
         else if (a == "--identify-threshold") cfg.identify_threshold = std::stof(next());
+        else if (a == "--finger-threshold") cfg.finger_threshold = std::stof(next());
+        else if (a == "--min-fingers") cfg.min_fingers = std::stoi(next());
+        else if (a == "--strong-single-threshold") cfg.strong_single_threshold = std::stof(next());
         else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -342,33 +529,62 @@ int main(int argc, char** argv) {
     srv.Get("/v1/stats", handler([&](const httplib::Request&, const json&, httplib::Response&) { return svc->stats(); }));
     srv.Post("/v1/extract",
              handler([&](const httplib::Request&, const json& j, httplib::Response&) { return svc->extract_ep(j); }));
-    srv.Put(R"(/v1/subjects/([^/]+))", handler([&](const httplib::Request& req, const json& j, httplib::Response& res) {
-                json out = svc->enroll(req.matches[1], j);
-                res.status = out["replaced"].get<bool>() ? 200 : 201;
-                return out;
+
+    // Subjects (customers) and their fingers.
+    auto put_subject = handler([&](const httplib::Request& req, const json& j, httplib::Response& res) {
+        bool created = false;
+        json out = svc->put_subject(req.matches[1], j, created);
+        res.status = created ? 201 : 200;
+        return out;
+    });
+    srv.Put(R"(/v1/subjects/([^/]+))", put_subject);
+    srv.Post(R"(/v1/subjects/([^/]+))", put_subject);  // v2.0 compatibility
+    srv.Get(R"(/v1/subjects/([^/]+))", handler([&](const httplib::Request& req, const json&, httplib::Response& res) {
+                auto s = svc->get_subject(req.matches[1]);
+                if (!s) {
+                    res.status = 404;
+                    return json{{"error", "unknown id"}};
+                }
+                return *s;
             }));
-    srv.Post(R"(/v1/subjects/([^/]+))", handler([&](const httplib::Request& req, const json& j, httplib::Response& res) {
-                 json out = svc->enroll(req.matches[1], j);
-                 res.status = out["replaced"].get<bool>() ? 200 : 201;
-                 return out;
-             }));
     srv.Delete(R"(/v1/subjects/([^/]+))", handler([&](const httplib::Request& req, const json&, httplib::Response& res) {
-                   if (!svc->remove(req.matches[1])) {
+                   if (!svc->delete_subject(req.matches[1])) {
                        res.status = 404;
                        return json{{"error", "unknown id"}};
                    }
                    return json{{"id", std::string(req.matches[1])}, {"deleted", true}};
                }));
+    auto put_finger = handler([&](const httplib::Request& req, const json& j, httplib::Response& res) {
+        bool created = false;
+        json out = svc->put_finger(req.matches[1], std::stoi(req.matches[2]), j, created);
+        res.status = created ? 201 : 200;
+        return out;
+    });
+    srv.Put(R"(/v1/subjects/([^/]+)/fingers/(\d{1,2}))", put_finger);
+    srv.Post(R"(/v1/subjects/([^/]+)/fingers/(\d{1,2}))", put_finger);
+    srv.Delete(R"(/v1/subjects/([^/]+)/fingers/(\d{1,2}))",
+               handler([&](const httplib::Request& req, const json&, httplib::Response& res) {
+                   if (!svc->delete_finger(req.matches[1], std::stoi(req.matches[2]))) {
+                       res.status = 404;
+                       return json{{"error", "unknown id or finger"}};
+                   }
+                   return json{{"id", std::string(req.matches[1])},
+                               {"position", std::stoi(req.matches[2])},
+                               {"deleted", true}};
+               }));
+
+    srv.Post("/v1/identify",
+             handler([&](const httplib::Request&, const json& j, httplib::Response&) { return svc->identify(j); }));
     srv.Post("/v1/verify", handler([&](const httplib::Request&, const json& j, httplib::Response& res) {
-                 json out = svc->verify(j);
-                 if (out.is_null()) {
+                 auto out = svc->verify(j);
+                 if (!out) {
                      res.status = 404;
                      return json{{"error", "unknown id"}};
                  }
-                 return out;
+                 return *out;
              }));
-    srv.Post("/v1/identify",
-             handler([&](const httplib::Request&, const json& j, httplib::Response&) { return svc->identify(j); }));
+    srv.Post("/v1/admin/compact",
+             handler([&](const httplib::Request&, const json&, httplib::Response&) { return svc->compact(); }));
     srv.Post("/v1/match", handler([&](const httplib::Request&, const json& j, httplib::Response&) { return svc->match(j); }));
 
     std::signal(SIGINT, on_signal);

@@ -1,0 +1,28 @@
+# Production compose file used by the auto-deploy workflow
+# (.github/workflows/deploy.yml copies it to the server as docker-compose.yml).
+#
+# The server directory (default ~/fp-extractor) holds:
+#   docker-compose.yml   this file
+#   .env                 FPX_API_KEY=... (create once by hand, chmod 600; never commit)
+#   .deploy-state        image currently deployed / previous image (written by remote-deploy.sh)
+#
+# FPX_IMAGE is set by the deploy script, e.g. ghcr.io/rabbicse/fp-extractor:sha-1a2b3c4
+services:
+  fpx:
+    image: ${FPX_IMAGE:?FPX_IMAGE must be set}
+    restart: unless-stopped
+    env_file: .env
+    # Bound to localhost: put a TLS reverse proxy (Caddy / nginx / cloud LB) in front.
+    # Set FPX_BIND=0.0.0.0 in .env only if the port is otherwise firewalled.
+    ports:
+      - "${FPX_BIND:-127.0.0.1}:${FPX_PORT:-8080}:8080"
+    command: ["--threads", "${FPX_MATCH_THREADS:-0}"]
+    volumes:
+      - fpx-data:/data
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+volumes:
+  fpx-data:   # templates live here - back this volume up

@@ -39,7 +39,7 @@ transit, and server CPU is reserved for matching.
 | Extraction | `extractor.hpp/.cpp` | FingerJet FX OSE (DigitalPersona, LGPL) → ANSI-378-2004 / ISO-19794-2-2005. Handles FingerJet's analysis-window limit by cropping around the detected finger and mapping coordinates back. |
 | Template codec | `template.hpp/.cpp` | Parse/serialise ANSI and ISO records, auto-detect format, convert between them. Works with templates from **any** vendor. |
 | Matcher | `matcher.hpp/.cpp` | Minutiae matcher (see [MATCHING.md](MATCHING.md)). Score 0–100. |
-| Gallery | `gallery.hpp/.cpp` | In-memory 1:N index: packed arenas, thread pool, top-k, insert/replace/remove, compaction. |
+| Gallery | `gallery.hpp/.cpp` | In-memory 1:N index of *subjects* with up to 10 finger slots each: packed arenas, thread pool, position-aware multi-finger search with per-subject score fusion, insert/replace/remove, compaction. |
 | Store | `store.hpp/.cpp` | Durable append-only log with CRC; torn-write recovery; compaction. |
 | Synthetic data | `synthetic.hpp/.cpp` | Realistic synthetic fingerprint images and templates for tests/benchmarks: no real biometrics in the repo. |
 | C API | `fpx_c.h`, `c_api.cpp` → `libfpx.so` | Stable ABI for Python, C#, Java, Go, Node. |
@@ -64,16 +64,36 @@ transit, and server CPU is reserved for matching.
   memory. The database is only for durability and administration.
 * **C++ engine, any language for the API.** See "Go or C++?" below.
 
+## Data model: subjects and fingers
+
+```
+subject "customer-42" ──┬─ finger 2 (right index)  → template (ANSI/ISO bytes in the store, compiled in RAM)
+                        ├─ finger 7 (left index)   → template
+                        └─ finger 0 (unknown)      → used by v2.0 single-template clients
+```
+
+* Store keys: `customer-42` for finger 0 (unchanged from v2.0, so existing
+  stores load as-is) and `customer-42\x1F7` for positioned fingers.
+* Search: one pass over all finger templates; each probe finger is compared
+  only with enrolled fingers of the same position (or all, if either side
+  is 0 = unknown). Scores are collected per subject, each probe finger is
+  assigned to at most one enrolled finger, and the `FusionPolicy` decides:
+  all presented fingers (≥ 2) above the per-finger threshold, or one very
+  strong finger. Candidates are ranked by decision, then by fused score.
+* Shard by subject id: all fingers of a customer must live on the same node.
+
 ## Data flow
 
 1. **Capture** (device): scanner SDK → 8-bit grayscale bitmap at the sensor's
    real DPI (usually 500).
 2. **Convert** (device, `libfpx`): optional `wsq_encode` for archival;
    `extract` → ANSI or ISO bytes.
-3. **Enrol**: `PUT /v1/subjects/{id}` with the template → appended to the store
-   (durable) → compiled and added to the in-memory gallery.
-4. **Identify**: `POST /v1/identify` → probe indexed once → all gallery
-   templates scored in parallel → top-k → `match` if best ≥ identify threshold.
+3. **Enrol**: `PUT /v1/subjects/{id}` with the customer's finger templates
+   (e.g. right + left index) → appended to the store (durable) → compiled and
+   added to the in-memory gallery.
+4. **Identify**: `POST /v1/identify` with the same fingers → each probe finger
+   indexed once → all gallery templates scored in parallel → fused per
+   customer → top-k → `match` under the two-finger policy.
 5. **Restart**: the store is replayed into RAM (≈ 15 s per million templates
    on 4 cores, mostly compilation).
 

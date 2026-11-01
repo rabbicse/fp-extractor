@@ -14,6 +14,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fpx {
@@ -51,5 +52,14 @@ private:
 };
 
 uint32_t crc32(const uint8_t* data, size_t n, uint32_t crc = 0);
+
+/// Store record key for (subject, finger). Finger 0 keeps the bare subject id,
+/// so single-finger stores written by earlier versions load unchanged.
+/// Other fingers: "<subject>\x1F<position>" (unit separator, never valid in ids).
+std::string make_store_key(const std::string& subject, uint8_t finger);
+/// Inverse of make_store_key. Throws fpx::Error on a malformed position.
+std::pair<std::string, uint8_t> split_store_key(const std::string& key);
+/// Subject ids: 1..256 bytes, no control characters (and so no '\x1F').
+bool valid_subject_id(const std::string& id);
 
 }  // namespace fpx
