@@ -1,0 +1,31 @@
+# Single node:            docker compose -f docker/docker-compose.yml up --build fpx
+# Sharded (2 + gateway):  docker compose -f docker/docker-compose.yml --profile sharded up --build
+services:
+  fpx:
+    build: { context: .., dockerfile: docker/Dockerfile }
+    ports: ["8080:8080"]
+    environment:
+      FPX_API_KEY: ${FPX_API_KEY:-change-me}
+    volumes: [fpx-data:/data]
+
+  shard0:
+    profiles: [sharded]
+    build: { context: .., dockerfile: docker/Dockerfile }
+    volumes: [shard0:/data]
+  shard1:
+    profiles: [sharded]
+    build: { context: .., dockerfile: docker/Dockerfile }
+    volumes: [shard1:/data]
+  gateway:
+    profiles: [sharded]
+    image: golang:1.22
+    working_dir: /app
+    volumes: [../examples/go-gateway:/app:ro]
+    command: ["go", "run", ".", "-shards", "http://shard0:8080,http://shard1:8080", "-listen", ":9090"]
+    ports: ["9090:9090"]
+    depends_on: [shard0, shard1]
+
+volumes:
+  fpx-data:
+  shard0:
+  shard1:

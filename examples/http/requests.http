@@ -1,0 +1,49 @@
+### fpx-server REST API (VS Code "REST Client" / JetBrains HTTP client format)
+@host = http://localhost:8080
+@key = change-me
+
+### Health
+GET {{host}}/healthz
+
+### Stats
+GET {{host}}/v1/stats
+X-API-Key: {{key}}
+
+### Extract (image -> template, optional WSQ). image = base64 BMP/PGM/TIFF/WSQ
+POST {{host}}/v1/extract
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"image": "<base64 image>", "dpi": 500, "format": "ansi", "wsq": true}
+
+### Enrol / replace (template preferred; "image" also accepted)
+PUT {{host}}/v1/subjects/customer-42
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"template": "<base64 ANSI-378 or ISO-19794-2>"}
+
+### 1:N identification
+POST {{host}}/v1/identify
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"template": "<base64>", "top_k": 5}
+
+### 1:1 verification against an enrolled id
+POST {{host}}/v1/verify
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"id": "customer-42", "template": "<base64>"}
+
+### 1:1 of two templates (nothing stored)
+POST {{host}}/v1/match
+X-API-Key: {{key}}
+Content-Type: application/json
+
+{"a": "<base64>", "b": "<base64>"}
+
+### Delete
+DELETE {{host}}/v1/subjects/customer-42
+X-API-Key: {{key}}

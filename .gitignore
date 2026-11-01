@@ -1,35 +1,28 @@
-# ignore build directory
+# build trees
+build/
+build-*/
+cmake-build-*/
 dist/
+out/
 
-# Prerequisites
-*.d
+# IDEs
+.idea/
+.vscode/
+*.cbp
 
-# Compiled Object files
-*.slo
-*.lo
+# local data - never commit biometric data
+*.fpxdb
+*.fpxdb.compact
+fpx-demo/
+data/
+
+# compiled artefacts
 *.o
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
 *.so
 *.dylib
 *.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
 *.a
 *.lib
-
-# Executables
 *.exe
 *.out
-*.app

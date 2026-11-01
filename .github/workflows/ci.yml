@@ -1,0 +1,34 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        build_type: [Release, Debug]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -Wno-dev
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Unit + integration tests
+        run: cd build && ctest --output-on-failure
+      - name: Synthetic accuracy check
+        if: matrix.build_type == 'Release'
+        run: build/fpx eval --synthetic 20x3
+      - name: Speed smoke test (100k gallery)
+        if: matrix.build_type == 'Release'
+        run: build/fpx bench --gallery 100000 --probes 10
+
+  go-gateway:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - run: cd examples/go-gateway && go vet ./... && go build ./...
