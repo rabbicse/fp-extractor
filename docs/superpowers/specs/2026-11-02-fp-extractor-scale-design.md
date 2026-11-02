@@ -255,7 +255,7 @@ React Native in `apps/mobile`, sharing `packages/api-client` with the web app.
 | Synthetic fingers and image files | Yes | Yes |
 | `libfpx` on the device (Option 1) | Yes | Yes |
 | Server-side conversion (Option 2) | Yes | Yes |
-| Live USB scanner capture | Yes, through the vendor SDK over USB OTG | No; revisit if the vendor provides an iOS SDK |
+| Live USB capture: DigitalPersona, Futronic | Yes, where the vendor SDK supports Android over USB OTG | No; revisit if a vendor provides an iOS SDK |
 
 Screens: capture, enrol, identify, verify, settings.
 
@@ -324,11 +324,11 @@ Each gets its own implementation plan and adds its own tests as it goes.
 | # | Milestone | Done when |
 |---|---|---|
 | 1 | Docs and baseline | Diagrams, guide, and benchmark and accuracy baselines committed |
-| 2 | Pre-filter experiment and WSQ impact | Gate result and WSQ measurement reported |
+| 2 | Variant lab, pre-filter experiment and WSQ impact | Section 16 runner works; gate result, WSQ and cross-device measurements reported |
 | 3 | Engine hardening | Concurrent search, fsync WAL, snapshots, gRPC node |
 | 4 | Go gateway and clustering | Section 8 chaos tests pass on a local cluster |
-| 5 | React web app | All screens covered by visual and end-to-end tests |
-| 6 | Mobile app | Android and iOS flows pass on emulators; USB capture passes on real hardware |
+| 5 | React web app and desktop scanner agent | All screens covered by visual and end-to-end tests; live capture passes on both scanners |
+| 6 | Mobile app | Android and iOS flows pass on emulators; USB capture passes on each scanner its SDK supports |
 | 7 | Load tests and simulation | Levels 1-3 reported; level 4 runbook ready |
 
 ## 14. Inputs needed from the project owner
@@ -336,7 +336,8 @@ Each gets its own implementation plan and adds its own tests as it goes.
 | Input | Needed by | If absent |
 |---|---|---|
 | FVC-style public datasets, with licences confirmed for this use | Milestone 2 | Gate cannot be passed; results stay synthetic only |
-| Scanner model and Android vendor SDK | Milestone 6 | USB capture stays behind the interface, untested on hardware |
+| Exact DigitalPersona and Futronic models, and their SDKs per platform | Milestone 5 | Live capture stays behind the interface, untested on hardware |
+| Consented scan corpus from both scanners (section 16) | Milestone 2 | Scanner and cross-device results are unavailable |
 | Apple developer account | Milestone 6 | iOS is limited to the simulator |
 | Legal review of FingerJet LGPL on iOS, and of any use of MCC | Before iOS distribution | iOS stays internal; MCC stays unused |
 | Cloud account and budget | Level 4 | Target remains projected |
@@ -351,3 +352,72 @@ Each gets its own implementation plan and adds its own tests as it goes.
 | WSQ-first conversion reduces accuracy | Measure in milestone 2; owner decides |
 | Actual cost exceeds estimates | Levels 1-3 replace estimates before level 4 spending |
 | Scope is large | Milestones ship independently, and work stops cleanly at each one |
+| Cross-device accuracy is lower than same-device | Measure every direction; report per pair; set thresholds per pair if needed |
+
+## 16. Variant test matrix
+
+The owner has tested with DigitalPersona and Futronic scanners and wants every
+option available to compare. A variant lab generates each valid combination from
+`tests/variants/matrix.yaml`, replays a stored scan corpus through it, and publishes
+a comparison report. The web app gains a Variants screen to browse the results.
+
+### Accuracy dimensions
+
+| Dimension | Values | Count |
+|---|---|---|
+| Enrol → probe scanner | DP → DP, Futronic → Futronic, DP → Futronic, Futronic → DP | 4 |
+| Conversion path | BMP → MINEX; BMP → WSQ 0.75 → MINEX; BMP → WSQ 2.25 → MINEX; server-side conversion; vendor SDK template | 5 |
+| Template format | ANSI-378 (MINEX), ISO-19794-2 | 2 |
+| Fingers presented | One, two | 2 |
+| Search mode | Full scan; cascade at 32, 64 or 128 bytes, each at 99% and 99.9% filtering | 7 |
+| Capture condition | Normal, dry, wet, partial, rotated, light pressure | 6 |
+
+Full matrix: 4 × 5 × 2 × 2 × 7 × 6 = **3,360 variants**. The same matrix also runs
+on public datasets and synthetic data, without the scanner-pair dimension.
+
+Vendor SDK templates run only where an SDK exports standard ANSI or ISO records.
+Combinations that cannot exist are recorded as skipped with a reason, never dropped
+silently.
+
+### How they run
+
+| Tier | Variants | Runs |
+|---|---|---|
+| Smoke | Synthetic only, one per path | Every PR |
+| Pairwise | Every pair of dimension values covered at least once | Nightly |
+| Full | All 3,360 | On demand, and before each release |
+
+Results for each variant: FNMR at FMR 1%, 0.1% and 0.01%; EER; Stage 1 survival; failure
+to enrol; latency; payload size. Each report states corpus size and evidence level, and
+flags results too small to support their FMR point.
+
+### Scan corpus
+
+* Each person scans on **both** scanners, because cross-device tests need the same
+  fingers on each. Target: at least 100 fingers × 4-8 impressions per scanner, with
+  the conditions above tagged at capture.
+* Written consent is required. Scans are encrypted, kept outside git, and never used
+  in CI. The lab reads the corpus from a configured private path.
+* A capture tool guides the operator through the protocol and names files consistently.
+
+### Live capture and client variants
+
+These run as functional tests, not accuracy tests.
+
+| Capture route | DigitalPersona | Futronic | Notes |
+|---|---|---|---|
+| Web app through `fpx-agent` | Yes | Yes | Go desktop agent on localhost wrapping the vendor SDK, for the OSes each SDK supports |
+| Android over USB OTG | If SDK supports | If SDK supports | Native module behind `FingerprintSource` |
+| iOS | No | No | Unless a vendor provides an SDK |
+| File import | Yes | Yes | Web, Android and iOS, using scans saved from either scanner |
+| Scanner simulator | Yes | Yes | Replays corpus or synthetic scans with each scanner's image size and DPI, for CI |
+
+Each route runs with client Options 1 and 2 where the client supports them. WebUSB is
+excluded because it needs vendor protocol details and browser support the SDKs do not
+guarantee.
+
+Scanner DPI comes from the device model or SDK, because wrong DPI is the most common
+cause of poor matching. The lab includes a negative test proving wrong DPI is detected
+in results.
+
+No conversion path or scanner pairing is chosen as the default until the report exists.
