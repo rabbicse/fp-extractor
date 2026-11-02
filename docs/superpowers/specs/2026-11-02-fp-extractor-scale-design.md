@@ -225,7 +225,7 @@ gateway, nodes and a small seeded synthetic gallery.
 | Verify | Check a finger against a subject | Score against threshold, matched minutiae side by side |
 | Pipeline | Open any search result | Gallery → Stage 1 → Stage 2 → decision, with timing per stage and shard |
 | Cluster | Kill or slow a node, start a traffic burst (local demo only) | Shard map, health, throughput, latency, hedges, `429`s |
-| Upload & Match | Upload BMP or WSQ files: compare two files 1:1, or search one or two files 1:N against the gallery | Preview, conversion steps, minutiae overlay, score and decision |
+| Upload & Match | Upload BMP, WSQ, MINEX or ISO files, singly or as a list: 1:1, 1:N, cross-match or up to 10 fingers per person (section 19) | Preview where an image exists, conversion steps, minutiae overlay, scores, decision, cross-match heatmap |
 | Mock Data | Generate mock people, seed a gallery, download their BMP and WSQ files for re-upload | Dataset size, seed, scanner profile, gallery counts |
 | Simulation | Set gallery size, rate, filter rate, nodes | Projected cores, latency, capacity |
 
@@ -482,3 +482,63 @@ Options considered:
 | ScyllaDB or Cassandra | Not used; worth revisiting past about 100M templates or for multi-region |
 | MongoDB, Elasticsearch | Not used; no advantage for either search or records here |
 | Storing templates in PostgreSQL as well | Not used; a second source of truth at this write volume, with backups covered by snapshots |
+
+## 19. Upload and match modes
+
+### Inputs
+
+Accepted on the web, in the mobile file import and through the API:
+
+* **Images:** BMP and WSQ.
+* **Templates:** MINEX (ANSI-378) and ISO-19794-2, with the format auto-detected and
+  mixed formats allowed in one request. Template uploads skip conversion, and the screen
+  shows a minutiae plot with no image behind it.
+* **Lists:** multiple files, a ZIP, or a CSV manifest listing file, subject and finger position.
+  Without a manifest, names follow `<subject>_<position>_<impression>.<ext>`. Files that
+  do not fit are listed for the user to fix, never guessed.
+
+### Modes
+
+| Mode | Input | Output | Run as |
+|---|---|---|---|
+| 1:1 | Two files | Score, decision, matched minutiae | Immediate |
+| 1:N | One finger | Ranked candidates | Immediate |
+| Multi-finger 1:N | 2-10 fingers of one person | Ranked candidates, per-finger scores, fused decision | Immediate |
+| Multi-finger 1:1 | 2-10 fingers against one subject | Per-finger scores, fused decision | Immediate |
+| Cross-match, within a list | N files, all against all | N × N score heatmap, genuine and impostor score distributions | Immediate to 10,000 pairs, then a job |
+| Cross-match, two lists | List A × list B | A × B score heatmap, best match for each file | Immediate to 10,000 pairs, then a job |
+| Batch 1:N | List of probes against the gallery | Result per probe, downloadable as CSV or JSON | Job |
+| Batch enrol | List of subjects and fingers | Created, replaced and rejected counts with reasons | Job |
+
+Multi-finger rules build on the existing `FusionPolicy`:
+
+* Fingers with known positions compare only against the same enrolled position. Position
+  0 (unknown) compares against every enrolled finger, which costs more, so the screen warns.
+* The user can pick a preset (2 of 2, 2 of N, or a higher number of fingers) or edit the
+  thresholds. The result always shows which policy made the decision.
+* The fused-decision thresholds for 3-10 fingers need calibrating on real scans. Until then,
+  those results are labelled uncalibrated.
+
+### Limits and jobs
+
+* A multi-finger search costs one search per finger, so a 10-finger search counts as 10 against
+  admission control. The 1,000 searches/s target means one-finger searches, and capacity
+  figures state their finger mix.
+* Jobs run in a separate gateway-managed worker queue at low priority, with progress and
+  cancel, and are paused or rejected under load so they cannot starve live searches.
+* Initial per-job limits: 1,000,000 cross-match pairs, 1,000 batch searches, and 2 GB of
+  uploads per job, all configurable. Above the limit, requests are rejected with `413`.
+* ZIP uploads are checked for file count, expanded size and unsafe paths before extraction.
+* Uploaded files stay only for the job's duration, encrypted on disk, and are deleted when it
+  ends. Job results expire after 24 hours by default.
+
+### Testing
+
+The section 16 variant lab adds input type (image or template) and the modes above as
+functional variants. Tests cover mixed-format lists, cross-match symmetry for lists compared
+with themselves, malformed and mislabelled files, and ZIP limits. Parser fuzzing includes
+MINEX and ISO uploads. Mock data can export all formats, in lists, with ground truth.
+
+Vendor templates, including those exported by DigitalPersona and Futronic SDKs, are accepted
+where they follow the standards. Cross-vendor accuracy is reported separately and can be lower
+than same-extractor accuracy.
