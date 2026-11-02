@@ -69,3 +69,17 @@ jobs:
             [ "$s" = healthy ] && exit 0; sleep 5
           done
           docker logs fpx; exit 1
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - run: npm run build

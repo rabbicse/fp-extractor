@@ -1,0 +1,11 @@
+{
+  "machine": "Measured on an Apple M1, 8 threads, 16 GB RAM",
+  "rows": [
+    { "label": "1,000 templates", "avg_ms": 24.6, "worst_ms": 54.4, "memory_mb": 3, "build_s": 0, "probes": 10, "evidence": "Measured, synthetic" },
+    { "label": "100,000 templates", "avg_ms": 395.3, "worst_ms": 1089.2, "memory_mb": 292, "build_s": 0.9, "probes": 10, "evidence": "Measured, synthetic" },
+    { "label": "1M templates", "avg_ms": 5034.8, "worst_ms": 10377.8, "memory_mb": 1543, "build_s": 7.6, "probes": 10, "evidence": "Measured, synthetic" },
+    { "label": "2M templates", "avg_ms": 15579.1, "worst_ms": 23337.5, "memory_mb": 3086, "build_s": 42.3, "probes": 5, "evidence": "Measured, synthetic" },
+    { "label": "5M templates", "avg_ms": 37187.7, "worst_ms": 54176.2, "memory_mb": 7715, "build_s": 49.2, "probes": 5, "evidence": "Measured, synthetic" },
+    { "label": "1M customers, 2 fingers each", "avg_ms": 11578.6, "worst_ms": 13706.6, "memory_mb": 2989, "build_s": 19.1, "probes": 5, "evidence": "Measured, synthetic" }
+  ]
+}
