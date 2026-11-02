@@ -7,16 +7,32 @@ Fingerprint toolkit and identification server, independent of the scanner:
 * **Extraction** with [FingerJet FX OSE](https://github.com/FingerJetFXOSE/FingerJetFXOSE) (DigitalPersona's open-source extractor)
 * **WSQ** compression with the NIST NBIS reference codec
 * **Matching** of ANSI-378 / ISO-19794-2 templates from any vendor (FingerJet has no matcher; this repo adds one)
-* **1:N identification**: 1,000,000 templates in **~5 s on 4 cores** (~1.5 GB RAM); target was ≤ 30–60 s
+* **1:N identification**: 1,000,000 synthetic templates in **~5 s on an Apple M1** (~1.5 GB RAM), see [capacity tables](docs/CAPACITY.md)
 * **CLI** (`fpx`), **REST server** (`fpx-server`), **C API** (`libfpx.so`) for Python / C# / Java / Go
 * Tests, benchmarks and demos use **synthetic fingerprints**, so no real biometric data is needed
 
-> Status: v2 rewrite on branch `feature/identification-engine`. The matcher is
-> validated on synthetic data only; **calibrate thresholds on your own
-> scanner data before production** ([docs/MATCHING.md](docs/MATCHING.md#calibration)).
+> Status: the matcher is validated on synthetic data only; **calibrate thresholds
+> on your own scanner data before production** ([docs/MATCHING.md](docs/MATCHING.md#calibration)).
 > For million-scale 1:N, enrol and search **two fingers per customer**
 > (supported by the server and CLI); single-finger margins at 1 M are thin
 > ([docs/SCALING.md](docs/SCALING.md)).
+
+## See it working
+
+![Two scans of one finger with matched minutiae connected](docs/assets/compare.png)
+
+```bash
+./scripts/demo.sh    # needs CMake, a C++17 compiler and Node.js
+```
+
+Open http://127.0.0.1:8080 and choose **Load sample gallery**. Upload BMP, WSQ, MINEX or ISO
+files, enrol customers, identify with up to 10 fingers, compare two prints, and cross-match a list.
+
+| Convert and inspect | Cross-match |
+|---|---|
+| ![BMP to WSQ to MINEX with minutiae overlay](docs/assets/scan.png) | ![Cross-match heatmap](docs/assets/crossmatch.png) |
+
+See also: [architecture](docs/ARCHITECTURE.md), [capacity and hardware](docs/CAPACITY.md), [roadmap](docs/ROADMAP.md).
 
 ---
 
@@ -26,7 +42,7 @@ Requirements: C++17 compiler (GCC ≥ 9 or Clang ≥ 10), CMake ≥ 3.16, git, n
 access on the first build (dependencies are fetched and pinned).
 
 ```bash
-git clone -b feature/identification-engine https://github.com/rabbicse/fp-extractor
+git clone https://github.com/rabbicse/fp-extractor
 cd fp-extractor
 cmake -S . -B build -Wno-dev            # Release by default
 cmake --build build -j

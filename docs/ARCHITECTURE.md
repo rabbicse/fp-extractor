@@ -1,5 +1,70 @@
 # Architecture
 
+This page describes the system as it runs today. For the planned scale architecture, see the
+[roadmap](ROADMAP.md) and [design spec](superpowers/specs/2026-11-02-fp-extractor-scale-design.md).
+
+## Today
+
+```mermaid
+flowchart LR
+  subgraph Clients
+    W[React demo]
+    D[Device with libfpx]
+    T[Thin client]
+  end
+  subgraph S[fpx-server, one process]
+    A[REST API]
+    X[Conversion: image to WSQ to MINEX or ISO]
+    G[(RAM gallery)]
+    M[Matcher threads]
+    L[(Append-only store)]
+  end
+  W --> A
+  D -- template --> A
+  T -- image --> A
+  A --> X
+  A --> G
+  G --> M
+  A -- enrol --> L
+  L -- replay on restart --> G
+```
+
+## Conversion and matching
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as fpx-server
+  participant G as RAM gallery
+  C->>S: BMP or WSQ, or a MINEX or ISO template
+  S->>S: BMP to WSQ to MINEX (templates skip this)
+  C->>S: PUT /v1/subjects/{id}
+  S->>S: Append to store
+  S->>G: Compile and add
+  C->>S: POST /v1/identify
+  S->>G: Scan every compatible template
+  G-->>S: Scores per finger
+  S-->>C: Fused decision and ranked candidates
+```
+
+## Planned scale architecture (not built)
+
+```mermaid
+flowchart TB
+  C[Web, mobile and device clients] --> LB[Load balancer with TLS]
+  LB --> GW[Go gateways, stateless]
+  GW -- one replica per shard --> N[fpx-node replicas on 256 virtual shards]
+  N --> S1[Stage 1: bit-signature scan]
+  S1 --> S2[Stage 2: existing matcher]
+  N --> W[(Log, snapshots and RocksDB on NVMe)]
+  GW --> O[(S3-compatible store: WSQ, audit, backups)]
+  N --> O
+  GW --> E[(etcd: shard map and leases)]
+  N --> E
+```
+
+Capacity numbers are in [CAPACITY.md](CAPACITY.md).
+
 ## Goal
 
 Any scanner, any vendor: the device turns a fingerprint bitmap into a standard

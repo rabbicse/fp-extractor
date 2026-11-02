@@ -1,5 +1,9 @@
 # Scaling 1:N identification to 1 M+ customers
 
+> These figures come from one 4-vCPU run with synthetic templates. Today's server runs one search at a
+> time per process. See [CAPACITY.md](CAPACITY.md) for newer measurements and hardware estimates, and
+> the [roadmap](ROADMAP.md) for planned scale work.
+
 Target: identify a probe against **1,000,000** enrolled templates in
 **≤ 30–60 s**. Measured result: **~5 s on 4 vCPUs**, so the target is met with
 a large margin. On a typical 16–32 core server expect roughly 1–2 s
