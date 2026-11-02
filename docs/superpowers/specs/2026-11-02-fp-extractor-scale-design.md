@@ -152,6 +152,12 @@ the cascade:
 | ≥ 99.5% only at 99% filtering | Pass, with about 5,000 estimated cores for Stage 2; report the cost before continuing |
 | < 99.5% at 99% filtering | Stop and revisit approximate vector search before building the cluster |
 
+Public datasets are too small to measure this alone: 99.9% filtering of 800 impressions
+keeps less than one candidate. Each real probe is therefore ranked against all real impostors
+plus synthetic distractors, up to at least 1M templates. The report states the real and synthetic
+counts. A pass that depends on synthetic distractors is a provisional pass, to be confirmed
+when a larger real corpus exists.
+
 ## 6. Client flows
 
 | | Option 1: on-device (default) | Option 2: server-side |
@@ -401,7 +407,9 @@ flags results too small to support their FMR point.
   the conditions above tagged at capture.
 * Written consent is required. Scans are encrypted, kept outside git, and never used
   in CI. The lab reads the corpus from a configured private path.
-* A capture tool guides the operator through the protocol and names files consistently.
+* A capture tool guides the operator through the protocol and names files consistently. It
+  ships with `fpx-agent` in milestone 5. Until then, scans saved with vendor tools are imported
+  and validated against a manifest.
 
 ### Live capture and client variants
 
