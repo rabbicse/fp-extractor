@@ -225,6 +225,8 @@ gateway, nodes and a small seeded synthetic gallery.
 | Verify | Check a finger against a subject | Score against threshold, matched minutiae side by side |
 | Pipeline | Open any search result | Gallery → Stage 1 → Stage 2 → decision, with timing per stage and shard |
 | Cluster | Kill or slow a node, start a traffic burst (local demo only) | Shard map, health, throughput, latency, hedges, `429`s |
+| Upload & Match | Upload BMP or WSQ files: compare two files 1:1, or search one or two files 1:N against the gallery | Preview, conversion steps, minutiae overlay, score and decision |
+| Mock Data | Generate mock people, seed a gallery, download their BMP and WSQ files for re-upload | Dataset size, seed, scanner profile, gallery counts |
 | Simulation | Set gallery size, rate, filter rate, nodes | Projected cores, latency, capacity |
 
 Engine and API additions:
@@ -421,3 +423,62 @@ cause of poor matching. The lab includes a negative test proving wrong DPI is de
 in results.
 
 No conversion path or scanner pairing is chosen as the default until the report exists.
+
+## 17. Mock data
+
+`fpx mockgen` extends the existing synthetic generator. It is seeded, so every dataset
+is reproducible.
+
+| Level | Output | Scale | Use |
+|---|---|---|---|
+| Images | BMP and WSQ files, several impressions per finger | Thousands of fingers | Upload testing, full conversion path, visual and end-to-end tests |
+| Templates | ANSI-378 and ISO records | Up to 10M+ | Gallery seeding, load tests, Stage 1 and Stage 2 speed |
+
+Options: number of people and fingers, impressions per finger, pattern type mix, enrolled
+versus stranger ratio, scanner profile (image size and DPI for each DigitalPersona and
+Futronic model), and capture conditions matching section 16. Every dataset writes a
+ground-truth manifest of who is who, so tests can score results automatically.
+
+Mock data proves speed, scale and correct behaviour. It does not prove real-world accuracy,
+because real fingers differ in ways a generator cannot fully reproduce. Results stay
+labelled synthetic, and thresholds are set from real scans and public datasets.
+
+A local 10M gallery needs more RAM than a 16 GB laptop can spare. Local runs stop at
+about 1M templates, and 10M runs need a larger machine.
+
+## 18. Storage and search
+
+Searching millions of fingerprints is not a database query. Minutiae matching compares
+geometry and tolerates distortion, so no database index can answer it. Search runs in RAM
+on `fpx-node`, and databases only store records.
+
+| Data | Where | Why | Estimated size at 10M, one copy |
+|---|---|---|---|
+| Stage 1 signatures | RAM on `fpx-node` | Scanned on every search | 0.3-1.3 GB |
+| Compiled templates | RAM on `fpx-node` | Read by Stage 2 | 15-30 GB |
+| Original templates | WAL and snapshots on node NVMe | System of record for matching data; rebuilds RAM after a restart | Up to 15 GB |
+| Subject records, audit log, enrolment status | PostgreSQL | Transactions, queries, reporting | Sized from retention policy |
+| Snapshot backups | S3-compatible object storage | Off-node disaster recovery | Same as snapshots |
+| WSQ archive (optional, off by default) | S3-compatible object storage, separate access controls | Re-extraction and audit | Measured per scanner |
+
+Multiply node sizes by the replica count. All stores are encrypted at rest. Subject records
+hold only an opaque subject ID, with customer identity kept in the owner's own systems.
+
+Enrolment across PostgreSQL and nodes:
+
+1. Write the subject to PostgreSQL as `pending`, with the idempotency key.
+2. Write the template to a node quorum (section 7).
+3. Mark the subject `active`. A reconciliation job finishes or rolls back any left `pending`.
+
+Options considered:
+
+| Option | Decision |
+|---|---|
+| PostgreSQL | **Chosen** for records and audit |
+| Custom WAL plus RAM gallery | **Chosen** for matching data |
+| S3-compatible storage | **Chosen** for backups and the optional WSQ archive |
+| Vector databases (such as Qdrant, Milvus) | Not used; only relevant if the section 5 gate fails and approximate search is adopted, and still needs matcher re-ranking |
+| Redis | Not used; adds a second RAM copy without helping search |
+| ScyllaDB or Cassandra | Not used; worth revisiting past about 100M templates or for multi-region |
+| MongoDB, Elasticsearch | Not used; no advantage for either search or records here |
+| Storing templates in PostgreSQL as well | Not used; a second source of truth at this write volume, with backups covered by snapshots |
