@@ -58,7 +58,7 @@ button.primary { background: var(--prussian); border-color: var(--prussian); col
 :focus-visible { outline: 3px solid var(--prussian); outline-offset: 2px; }
 .specimens { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; overflow-y: auto; }
 .specimens button { width: 100%; display: flex; justify-content: space-between; gap: 1rem; background: transparent; border-color: transparent; }
-.specimens button[aria-pressed="true"] { background: var(--plate); border-left: 3px solid var(--ending); }
+.specimens button[aria-pressed="true"] { background: var(--plate); font-weight: 700; }
 main { padding: 1.25rem 2rem 3rem; min-width: 0; }
 nav { display: flex; flex-wrap: wrap; gap: 1.25rem; border-bottom: 1px solid var(--line); margin-bottom: 1.75rem; }
 nav button { background: none; border: 0; border-radius: 0; padding: 0.5rem 0; border-bottom: 3px solid transparent; margin-bottom: -1px; }
@@ -123,7 +123,7 @@ th.num, td.num { text-align: right; padding-left: 1rem; }
 .perf { display: grid; gap: 0.75rem; max-width: 44rem; }
 .perf h2:not(:first-child) { margin-top: 1.5rem; }
 .perf p { margin: 0; }
-.note { border-left: 3px solid var(--ending); padding-left: 0.75rem; margin-top: 1rem !important; }
+.note { border-top: 1px solid var(--line); padding-top: 0.75rem; margin-top: 1rem !important; }
 @media (max-width: 800px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
   main { padding: 1rem; }
