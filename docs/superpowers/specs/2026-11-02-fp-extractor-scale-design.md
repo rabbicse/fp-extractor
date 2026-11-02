@@ -91,8 +91,8 @@ the cascade at 99.9% filtering.
   │   Write-ahead log with fsync → RAM gallery       │
   └──────────────────────────────────────────────────┘
              ▲                          ▲
-   shard map, leases, health      PostgreSQL
-   (etcd)                         subject records, audit
+   shard map, leases, health      S3-compatible object store
+   (etcd)                         WSQ files, backups, audit
 ```
 
 | Component | Location | Responsibility |
@@ -158,9 +158,9 @@ the cascade:
 |---|---|---|
 | For | Devices and apps that can run `libfpx` | Thin clients without native code |
 | On the device | BMP → WSQ → MINEX | Capture BMP or WSQ |
-| Sent to the API | MINEX template; WSQ only if archiving is on | The image |
-| On the server | Matching | Image → WSQ if needed → MINEX → matching |
-| Trade-off | Small payload, no raw image in transit, less server CPU | Simple client, raw images in transit, extraction capacity needed |
+| Sent to the API | Enrol: MINEX or ISO template plus WSQ. Search: template only | The image |
+| On the server | Store on enrol; matching | Image → WSQ if needed → MINEX or ISO → store on enrol; matching |
+| Trade-off | Small search payloads, no raw image sent for searches, less server CPU | Simple client, raw images in transit for every call, extraction capacity needed |
 
 * MINEX means ANSI-378. It becomes the API default, replacing ISO. ISO templates
   remain accepted.
@@ -201,7 +201,8 @@ unbounded queue.
 | Gateway down | Load balancer reroutes | Retry of in-flight requests |
 | Malformed input | Rejected before the matcher | `400` |
 | etcd down | Gateways use the last known map; rebalancing and leader changes pause | Nothing, except writes to a shard needing a new leader |
-| PostgreSQL down | Writes fail; searches fail closed by default, configurable | `503` |
+| Object store down | Enrolments fail, because WSQ cannot be saved; searches continue; audit events spool to gateway disk | `503` on enrol only |
+| Audit spool full | Requests fail closed by default, configurable | `503` |
 
 Operations:
 
@@ -244,8 +245,8 @@ step. `libfpx` is not compiled to WebAssembly in this version, and the screen sa
 so. Real on-device conversion is demonstrated in the mobile app.
 
 Safety: synthetic generation and fault controls need `DEMO_MODE`, which is off by
-default and refused under the production profile. Uploads are processed in memory
-and not stored. Only enrolled templates are saved. A banner warns against uploading
+default and refused under the production profile. Search and match uploads are not kept.
+Enrolment saves the template and WSQ. A banner warns against uploading
 real people's fingerprints. Every number is tagged measured, synthetic or projected.
 
 ## 10. Mobile app
@@ -277,7 +278,7 @@ Screens: capture, enrol, identify, verify, settings.
 | Web and mobile unit | Vitest, Testing Library, Jest | Every push |
 | Robustness | ASan, UBSan, TSan; libFuzzer, Go fuzzing | Sanitizers every push, fuzzing nightly |
 | Contract | Generated gRPC and OpenAPI schemas | Every push |
-| Integration | Docker Compose with real gateway, nodes, etcd, PostgreSQL | Every push |
+| Integration | Docker Compose with real gateway, nodes, etcd, S3-compatible store | Every push |
 | Chaos | Node kills, Toxiproxy, covering section 8 | Small set per PR, full set nightly |
 | Visual | Playwright screenshots with seeded data, light and dark | Every PR |
 | End-to-end, web | Playwright against the full stack | Every PR |
@@ -456,32 +457,46 @@ on `fpx-node`, and databases only store records.
 |---|---|---|---|
 | Stage 1 signatures | RAM on `fpx-node` | Scanned on every search | 0.3-1.3 GB |
 | Compiled templates | RAM on `fpx-node` | Read by Stage 2 | 15-30 GB |
-| Original templates | WAL and snapshots on node NVMe | System of record for matching data; rebuilds RAM after a restart | Up to 15 GB |
-| Subject records, audit log, enrolment status | PostgreSQL | Transactions, queries, reporting | Sized from retention policy |
-| Snapshot backups | S3-compatible object storage | Off-node disaster recovery | Same as snapshots |
-| WSQ archive (optional, off by default) | S3-compatible object storage, separate access controls | Re-extraction and audit | Measured per scanner |
+| Original MINEX/ISO templates | WAL and snapshots on node NVMe | Sequential writes and fast RAM rebuilds; stored in the format received | Up to 15 GB |
+| Subject metadata (status, finger list, WSQ reference) | RocksDB on each node, fed by the same replicated WAL | Fast key lookups, with no second system to keep consistent | Estimated under 5 GB |
+| WSQ files | S3-compatible object store, keyed by SHA-256 of the content, with separate access controls | Large files stay out of the matching path | Estimated 100-300 GB; measured per scanner |
+| Audit events | Gateway disk spool, batched to the object store as compressed files | Append-only and cheap | Sized from retention policy |
+| Snapshot backups | S3-compatible object store | Off-node disaster recovery | Same as snapshots |
 
-Multiply node sizes by the replica count. All stores are encrypted at rest. Subject records
-hold only an opaque subject ID, with customer identity kept in the owner's own systems.
+Multiply node sizes by the replica count. All stores are encrypted at rest. Records hold only
+an opaque subject ID, with customer identity kept in the owner's own systems. WSQ storage is on
+by default and can be turned off per deployment. WSQ files are stored unchanged as received, or
+as produced by server-side conversion, and templates can be re-extracted from them.
 
-Enrolment across PostgreSQL and nodes:
+Enrolment:
 
-1. Write the subject to PostgreSQL as `pending`, with the idempotency key.
-2. Write the template to a node quorum (section 7).
-3. Mark the subject `active`. A reconciliation job finishes or rolls back any left `pending`.
+1. Upload the WSQ to the object store. Its content hash is the key, so retries are safe.
+2. Write the template, metadata and WSQ hash as one record to a node quorum (section 7).
+3. Acknowledge the client. A cleanup job deletes WSQ files no record references after a
+   grace period.
+
+Because one replicated record holds the template and metadata, the two cannot disagree.
+
+Reading WSQ never happens during a search. It is used only for audit, re-extraction and
+template upgrades. Storage choice does not affect search speed, which comes from RAM. It
+affects enrol speed, restart time and cost.
 
 Options considered:
 
 | Option | Decision |
 |---|---|
-| PostgreSQL | **Chosen** for records and audit |
-| Custom WAL plus RAM gallery | **Chosen** for matching data |
-| S3-compatible storage | **Chosen** for backups and the optional WSQ archive |
-| Vector databases (such as Qdrant, Milvus) | Not used; only relevant if the section 5 gate fails and approximate search is adopted, and still needs matcher re-ranking |
+| WAL, snapshots and RocksDB on nodes | **Chosen**: lowest latency path, no database cluster to run |
+| S3-compatible object store | **Chosen** for WSQ, backups and audit. Self-hosted choice (such as SeaweedFS or MinIO) is made at deployment after a licence check |
+| ScyllaDB or Cassandra | **Alternative** for multi-region or past about 100M templates; another cluster to run, and it duplicates node replication |
+| Aerospike | Not used; strong on NVMe, but larger features need a commercial licence and it duplicates node replication |
+| Storing WSQ inside any database | Not used; large values hurt compaction and slow backups |
+| Vector databases (such as Qdrant, Milvus) | Not used; only relevant if the section 5 gate fails, and still needs matcher re-ranking |
 | Redis | Not used; adds a second RAM copy without helping search |
-| ScyllaDB or Cassandra | Not used; worth revisiting past about 100M templates or for multi-region |
-| MongoDB, Elasticsearch | Not used; no advantage for either search or records here |
-| Storing templates in PostgreSQL as well | Not used; a second source of truth at this write volume, with backups covered by snapshots |
+| MongoDB, Elasticsearch | Not used; no advantage for this workload |
+| PostgreSQL or another RDBMS | Rejected at the owner's request |
+
+Trade-off: there is no SQL for ad-hoc reporting. Reports come from audit files in the object store,
+which a query engine such as DuckDB can read directly, and from a subject export.
 
 ## 19. Upload and match modes
 
