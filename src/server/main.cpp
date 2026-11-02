@@ -90,6 +90,8 @@ struct Config {
     int min_fingers = 2;
     float strong_single_threshold = 30.0f;
     int default_dpi = 500;
+    bool demo = false;     // enables synthetic generation
+    std::string web_root;  // serves the built web app when set
 };
 
 void usage() {
@@ -101,6 +103,8 @@ void usage() {
         "           [--finger-threshold 12]       1:N/1:1, per finger when two or more are presented\n"
         "           [--min-fingers 2]             fingers that must reach --finger-threshold\n"
         "           [--strong-single-threshold 30] one finger alone this strong also matches (0 = off)\n"
+        "           [--demo]                      enable synthetic finger generation (never in production)\n"
+        "           [--web-root DIR]              serve the built web app from DIR\n"
         "Environment: FPX_API_KEY overrides --api-key.");
 }
 
@@ -409,6 +413,143 @@ public:
         return {{"score", s}, {"threshold", thr}, {"match", s >= thr}};
     }
 
+    // --- demo and test bench endpoints --------------------------------------
+    // Any upload -> template, following BMP -> WSQ -> MINEX for images.
+    struct Inspected {
+        std::string kind, source_format;
+        GrayImage image;
+        std::vector<uint8_t> wsq;
+        FingerTemplate tmpl;
+        json steps = json::array();
+    };
+
+    Inspected inspect_bytes(const std::vector<uint8_t>& bytes, int dpi, float bitrate) const {
+        using clock = std::chrono::steady_clock;
+        auto ms_since = [](clock::time_point t) {
+            return std::chrono::duration<double, std::milli>(clock::now() - t).count();
+        };
+        Inspected r;
+        if (bytes.empty()) throw Error400("file is empty");
+        if (looks_like_template(bytes)) {
+            r.kind = "template";
+            try {
+                r.tmpl = parse_template(bytes);
+            } catch (const Error& e) {
+                throw Error400(std::string("bad template: ") + e.what());
+            }
+            r.source_format = to_string(r.tmpl.format);
+            return r;
+        }
+        const ImageFormat fmt = detect_image_format(bytes);
+        if (fmt == ImageFormat::Unknown) throw Error400("unrecognised file: expected BMP, PGM, TIFF, WSQ, MINEX or ISO");
+        try {
+            r.kind = "image";
+            r.source_format = to_string(fmt);
+            auto t = clock::now();
+            r.image = decode_image(bytes, dpi);
+            r.steps.push_back({{"name", "decode"}, {"ms", ms_since(t)}, {"bytes", bytes.size()}});
+            t = clock::now();
+            r.wsq = fmt == ImageFormat::Wsq ? bytes : wsq_encode(r.image, bitrate);
+            GrayImage decoded = wsq_decode(r.wsq, r.image.dpi);
+            decoded.dpi = r.image.dpi;
+            r.steps.push_back({{"name", "wsq"}, {"ms", ms_since(t)}, {"bytes", r.wsq.size()}});
+            t = clock::now();
+            ExtractOptions o;
+            o.format = TemplateFormat::Ansi378_2004;
+            auto ex = extract(decoded, o);
+            r.tmpl = ex.parsed;
+            r.steps.push_back({{"name", "minex"}, {"ms", ms_since(t)}, {"bytes", ex.record.size()}});
+        } catch (const Error400&) {
+            throw;
+        } catch (const Error& e) {
+            throw Error400(std::string("bad image: ") + e.what());
+        }
+        return r;
+    }
+
+    static std::vector<uint8_t> file_field(const json& j, const char* key) {
+        if (!j.contains(key) || !j[key].is_string()) throw Error400(std::string("'") + key + "' (base64 file) is required");
+        return b64decode(j[key].get<std::string>());
+    }
+
+    json inspect(const json& j) const {
+        Inspected r = inspect_bytes(file_field(j, "file"), j.value("dpi", cfg_.default_dpi), j.value("wsq_bitrate", 0.75f));
+        json minutiae = json::array();
+        for (const Minutia& m : r.tmpl.minutiae)
+            minutiae.push_back({{"x", m.x}, {"y", m.y}, {"angle", m.angle}, {"type", int(m.type)}, {"quality", m.quality}});
+        json out = {{"kind", r.kind},
+                    {"source_format", r.source_format},
+                    {"width", r.tmpl.width},
+                    {"height", r.tmpl.height},
+                    {"minutiae", minutiae},
+                    {"steps", r.steps},
+                    {"template_ansi", b64encode(serialize_template(r.tmpl, TemplateFormat::Ansi378_2004))},
+                    {"template_iso", b64encode(serialize_template(r.tmpl, TemplateFormat::Iso19794_2_2005))}};
+        if (r.kind == "image") {
+            out["preview_bmp"] = b64encode(encode_bmp(r.image));
+            out["wsq"] = b64encode(r.wsq);
+            out["dpi"] = r.image.dpi;
+        }
+        return out;
+    }
+
+    json compare(const json& j) const {
+        const int dpi = j.value("dpi", cfg_.default_dpi);
+        FingerTemplate a = inspect_bytes(file_field(j, "a"), dpi, 0.75f).tmpl;
+        FingerTemplate b = inspect_bytes(file_field(j, "b"), dpi, 0.75f).tmpl;
+        const Matcher& matcher = gallery_.matcher();
+        const float score = matcher.match(a, b);
+        Probe probe(a, matcher.config());
+        CompiledTemplate cb = compile(b, matcher.config());
+        MatchDetails d;
+        matcher.match(probe, cb.view(), &d, true);
+        json pairs = json::array();
+        for (auto& [pi, ci] : d.pairs) {
+            const CMinutia& pm = probe.tmpl().minutiae[size_t(pi)];
+            const CMinutia& cm = cb.minutiae[size_t(ci)];
+            pairs.push_back({{"a", {{"x", pm.x}, {"y", pm.y}}}, {"b", {{"x", cm.x}, {"y", cm.y}}}});
+        }
+        const float thr = j.value("threshold", cfg_.verify_threshold);
+        return {{"score", score},
+                {"threshold", thr},
+                {"match", score >= thr},
+                {"rotation_deg", d.rotation_deg},
+                {"pairs", pairs}};
+    }
+
+    json crossmatch(const json& j) const {
+        if (!j.contains("files") || !j["files"].is_array() || j["files"].size() < 2)
+            throw Error400("'files' must list at least 2 files");
+        if (j["files"].size() > 100) throw Error400("at most 100 files per cross-match");
+        const int dpi = j.value("dpi", cfg_.default_dpi);
+        std::vector<std::string> names;
+        std::vector<FingerTemplate> templates;
+        for (const auto& f : j["files"]) {
+            const std::string name = f.value("name", "file " + std::to_string(names.size() + 1));
+            try {
+                templates.push_back(inspect_bytes(file_field(f, "file"), dpi, 0.75f).tmpl);
+            } catch (const std::exception& e) {
+                throw Error400(name + ": " + e.what());
+            }
+            names.push_back(name);
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        const Matcher& matcher = gallery_.matcher();
+        std::vector<std::vector<float>> scores(names.size(), std::vector<float>(names.size(), 0.f));
+        for (size_t a = 0; a < names.size(); ++a)
+            for (size_t b = a; b < names.size(); ++b) scores[a][b] = scores[b][a] = matcher.match(templates[a], templates[b]);
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return {{"names", names}, {"scores", scores}, {"threshold", cfg_.verify_threshold}, {"elapsed_ms", ms}};
+    }
+
+    static json synthetic(const json& j) {
+        if (!j.contains("finger_id") || !j["finger_id"].is_number_unsigned())
+            throw Error400("'finger_id' must be a non-negative integer");
+        const uint32_t finger = j["finger_id"].get<uint32_t>();
+        const uint32_t impression = j.value("impression", 0u);
+        return {{"file", b64encode(encode_bmp(synthesize_image(finger, impression)))}};
+    }
+
     // Rewrite the store with live records only and repack the gallery. Done
     // inside the server so the open store file is swapped safely.
     json compact() {
@@ -463,6 +604,8 @@ int main(int argc, char** argv) {
         else if (a == "--finger-threshold") cfg.finger_threshold = std::stof(next());
         else if (a == "--min-fingers") cfg.min_fingers = std::stoi(next());
         else if (a == "--strong-single-threshold") cfg.strong_single_threshold = std::stof(next());
+        else if (a == "--demo") cfg.demo = true;
+        else if (a == "--web-root") cfg.web_root = next();
         else if (a == "--help" || a == "-h") {
             usage();
             return 0;
@@ -486,7 +629,11 @@ int main(int argc, char** argv) {
     g_server = &srv;
     const int http_threads = cfg.http_threads;
     srv.new_task_queue = [http_threads] { return new httplib::ThreadPool(size_t(http_threads)); };
-    srv.set_payload_max_length(20 * 1024 * 1024);
+    srv.set_payload_max_length(64 * 1024 * 1024);  // cross-match lists can hold 100 images
+    if (!cfg.web_root.empty() && !srv.set_mount_point("/", cfg.web_root)) {
+        std::fprintf(stderr, "web root not found: %s\n", cfg.web_root.c_str());
+        return 1;
+    }
 
     // Auth + JSON error handling wrapper.
     auto handler = [&](auto fn) {
@@ -586,6 +733,15 @@ int main(int argc, char** argv) {
     srv.Post("/v1/admin/compact",
              handler([&](const httplib::Request&, const json&, httplib::Response&) { return svc->compact(); }));
     srv.Post("/v1/match", handler([&](const httplib::Request&, const json& j, httplib::Response&) { return svc->match(j); }));
+    srv.Post("/v1/inspect", handler([&](const httplib::Request&, const json& j, httplib::Response&) { return svc->inspect(j); }));
+    srv.Post("/v1/compare", handler([&](const httplib::Request&, const json& j, httplib::Response&) { return svc->compare(j); }));
+    srv.Post("/v1/crossmatch",
+             handler([&](const httplib::Request&, const json& j, httplib::Response&) { return svc->crossmatch(j); }));
+    if (cfg.demo) {
+        srv.Post("/v1/demo/synthetic",
+                 handler([&](const httplib::Request&, const json& j, httplib::Response&) { return Service::synthetic(j); }));
+        std::fprintf(stderr, "DEMO MODE: synthetic generation enabled, not for production\n");
+    }
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

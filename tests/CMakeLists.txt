@@ -21,4 +21,7 @@ if(Python3_FOUND AND FPX_BUILD_SERVER)
   add_test(NAME server_e2e
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/server_test.py
                    $<TARGET_FILE:fpx_cli> $<TARGET_FILE:fpx_server> ${CMAKE_CURRENT_BINARY_DIR}/server_e2e)
+  add_test(NAME server_demo_e2e
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/server_demo_test.py
+                   $<TARGET_FILE:fpx_server> ${CMAKE_CURRENT_BINARY_DIR}/server_demo_e2e)
 endif()
