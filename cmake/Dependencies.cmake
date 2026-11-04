@@ -35,7 +35,10 @@ target_include_directories(fingerjet
   PUBLIC  ${FJ_ROOT}/libFRFXLL/include
   PRIVATE ${FJ_ROOT}/libFRFXLL/src/algorithm)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(fingerjet PRIVATE -O3 -w -Wno-deprecated)
+  # -fwrapv: the fixed-point DSP code relies on signed overflow wrapping
+  # (UBSan reports it in orimap.h); make that defined instead of UB the
+  # optimiser may exploit.
+  target_compile_options(fingerjet PRIVATE -O3 -w -Wno-deprecated -fwrapv)
   target_compile_definitions(fingerjet PRIVATE LINUX)
 endif()
 set_target_properties(fingerjet PROPERTIES CXX_STANDARD 11 OUTPUT_NAME FRFXLL)

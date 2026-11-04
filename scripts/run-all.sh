@@ -37,6 +37,9 @@ BUILD="$ROOT/build"
 JOBS="$(nproc 2>/dev/null || echo 4)"
 PORT_BASE="${FPX_TEST_PORT_BASE:-18700}"   # local ports used: PORT_BASE .. PORT_BASE+20
 export PATH="$HOME/.local/bin:$PATH"
+# Extra CMake arguments, e.g. pre-fetched dependencies in the test image
+# (docker/Dockerfile.test). Word-split on purpose.
+read -r -a CMAKE_EXTRA <<<"${FPX_CMAKE_ARGS:-}"
 # Checkouts on drives owned by another user (NTFS/exFAT mounts, containers) make
 # git refuse to work ("dubious ownership"). Trust them for this script only.
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'
@@ -104,23 +107,23 @@ s_tools() {
 }
 
 s_build() {
-  cmake -S . -B "$BUILD" -Wno-dev -DCMAKE_BUILD_TYPE=Release
+  cmake -S . -B "$BUILD" -Wno-dev -DCMAKE_BUILD_TYPE=Release "${CMAKE_EXTRA[@]}"
   cmake --build "$BUILD" -j"$JOBS" 2>&1 | tee "$WORK/build-output.txt"
   if grep -E "warning:" "$WORK/build-output.txt" | grep -v "_deps/" ; then echo "compiler warnings in project code"; exit 1; fi
 }
 
-s_unit() { (cd "$BUILD" && ctest --output-on-failure); }
+s_unit() { (cd "$BUILD" && ctest --output-on-failure --no-tests=error); }  # 0 tests must not pass
 
 s_sanitizers() {
   local SB="$ROOT/build-asan" F="-fsanitize=address,undefined -fno-omit-frame-pointer"
   cmake -S . -B "$SB" -Wno-dev -DCMAKE_BUILD_TYPE=Debug -DFPX_BUILD_EXAMPLES=OFF \
     "-DCMAKE_CXX_FLAGS=$F" "-DCMAKE_C_FLAGS=$F" "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined" \
-    "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined" -DFETCHCONTENT_BASE_DIR="$BUILD/_deps"
+    "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined" -DFETCHCONTENT_BASE_DIR="$BUILD/_deps" "${CMAKE_EXTRA[@]}"
   cmake --build "$SB" -j"$JOBS"
   mkdir -p "$WORK/san"
   # log_path also catches reports from the servers that the e2e tests start
-  (cd "$SB" && ASAN_OPTIONS="log_path=$WORK/san/asan" UBSAN_OPTIONS="log_path=$WORK/san/ubsan:print_stacktrace=1" \
-     ctest --output-on-failure)
+  (cd "$SB" && ASAN_OPTIONS="log_path=$WORK/san/asan" UBSAN_OPTIONS="log_path=$WORK/san/ubsan:print_stacktrace=1:suppressions=$ROOT/tests/ubsan.supp" \
+     ctest --output-on-failure --no-tests=error)
   if ls "$WORK"/san/* >/dev/null 2>&1; then cat "$WORK"/san/*; echo "sanitizer reports found"; exit 1; fi
   echo "no ASan/UBSan reports"
 }
@@ -222,7 +225,7 @@ s_load() {
 s_web() {
   have npm || { echo "npm not installed"; exit 1; }
   cd apps/web
-  npm ci --no-audit --no-fund
+  npm ci --no-audit --no-fund --prefer-offline
   npm test
   npm run build
   npx playwright install chromium

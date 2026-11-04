@@ -1,0 +1,5 @@
+# UBSan suppressions for third-party code only (used by scripts/run-all.sh --full).
+# FingerJet (LGPL, pinned upstream) left-shifts negative values in fixed-point
+# helpers: defined since C++20 and what GCC/Clang do, not worth patching upstream.
+# Its signed overflows are made defined with -fwrapv (cmake/Dependencies.cmake).
+shift-base:FingerJetFXOSE

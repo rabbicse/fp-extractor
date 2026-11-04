@@ -1,0 +1,51 @@
+# Test image: every tool scripts/run-all.sh needs, pinned, with dependencies
+# pre-fetched so a run needs no network. Same results on any host (Linux, macOS,
+# Windows/WSL), including the Playwright screenshots.
+#
+#   scripts/test-in-docker.sh              # build the image and run everything
+#   scripts/test-in-docker.sh --quick      # any run-all.sh options
+#
+# The Docker stage of run-all.sh (image, HEALTHCHECK, compose) needs a Docker
+# daemon and runs on the host instead: scripts/run-all.sh --only docker.
+FROM ubuntu:24.04
+
+ARG NODE_VERSION=22.13.1
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ca-certificates curl xz-utils python3 golang-go shellcheck \
+ && rm -rf /var/lib/apt/lists/*
+RUN arch="$(dpkg --print-architecture | sed 's/amd64/x64/')" \
+ && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${arch}.tar.xz" \
+    | tar -xJ -C /usr/local --strip-components=1 \
+ && node --version && npm --version
+
+# Writable caches for any user id (the run uses the host user, so reports are theirs).
+ENV HOME=/tmp/home \
+    npm_config_cache=/opt/cache/npm \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    GOCACHE=/tmp/go-cache \
+    GOFLAGS=-buildvcs=false \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=*
+
+# C++ dependencies (FingerJet, httplib, json, doctest), fetched once at their pinned versions.
+COPY cmake/ /opt/deps-src/cmake/
+COPY third_party/ /opt/deps-src/third_party/
+RUN printf '%s\n' 'cmake_minimum_required(VERSION 3.16)' 'project(fpx_deps C CXX)' \
+        'set(FPX_BUILD_SERVER ON)' 'set(FPX_BUILD_TESTS ON)' 'include(cmake/Dependencies.cmake)' \
+        > /opt/deps-src/CMakeLists.txt \
+ && cmake -S /opt/deps-src -B /opt/deps -Wno-dev
+ENV FPX_CMAKE_ARGS="-DFETCHCONTENT_BASE_DIR=/opt/deps/_deps -DFETCHCONTENT_FULLY_DISCONNECTED=ON"
+
+# Web dependencies and Chromium (with its system libraries) for Playwright.
+COPY apps/web/package.json apps/web/package-lock.json /opt/web/
+RUN cd /opt/web && npm ci --no-audit --no-fund \
+ && npx playwright install --with-deps chromium \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+RUN cp -a /opt/web/node_modules apps/web/ \
+ && mkdir -p /tmp/home test-reports && chmod -R a+rwX /src /opt/cache /opt/deps /tmp/home
+
+ENTRYPOINT ["scripts/run-all.sh"]
+CMD ["--skip", "docker"]
