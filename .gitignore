@@ -35,3 +35,7 @@ node_modules/
 apps/web/dist/
 apps/web/test-results/
 apps/web/playwright-report/
+
+# run-all reports
+test-reports/
+__pycache__/
