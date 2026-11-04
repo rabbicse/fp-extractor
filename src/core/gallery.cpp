@@ -5,10 +5,12 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 #include "fpx/image.hpp"  // fpx::Error
 
@@ -32,23 +34,57 @@ public:
     int size() const { return int(workers_.size()) + 1; }
 
     void run(int n, const std::function<void(int)>& fn) {
-        std::lock_guard<std::mutex> job_lock(job_mu_);  // one job at a time on this pool
+        // One job at a time on this pool, admitted in arrival order. A plain
+        // mutex is not fair: under concurrent searches some requests waited
+        // many times longer than others (p95 several times p50).
+        Turn turn(*this);
         n = std::max(1, std::min(n, size()));
         {
             std::lock_guard<std::mutex> lk(mu_);
             fn_ = &fn;
             job_n_ = n;
             active_ = n;
+            error_ = nullptr;
             ++generation_;
         }
         cv_.notify_all();
-        fn(0);
+        call(fn, 0);
+        // Always wait for the workers: fn refers to the caller's stack.
         std::unique_lock<std::mutex> lk(mu_);
         if (--active_ > 0) done_cv_.wait(lk, [&] { return active_ == 0; });
         fn_ = nullptr;
+        if (error_) std::rethrow_exception(std::exchange(error_, nullptr));
     }
 
 private:
+    // FIFO ticket: waits for this caller's turn, releases it on scope exit.
+    struct Turn {
+        ThreadPool& p;
+        explicit Turn(ThreadPool& pool) : p(pool) {
+            std::unique_lock<std::mutex> lk(p.queue_mu_);
+            const uint64_t ticket = p.next_ticket_++;
+            p.queue_cv_.wait(lk, [&] { return p.serving_ == ticket; });
+        }
+        ~Turn() {
+            {
+                std::lock_guard<std::mutex> lk(p.queue_mu_);
+                ++p.serving_;
+            }
+            p.queue_cv_.notify_all();
+        }
+    };
+
+    // Keeps the first exception of a job for the caller to rethrow; an
+    // exception escaping a worker thread would terminate the process.
+    void call(const std::function<void(int)>& fn, int idx) {
+        try {
+            fn(idx);
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!error_) error_ = std::current_exception();
+        }
+    }
+
     void loop(int idx) {
         uint64_t seen = 0;
         for (;;) {
@@ -61,15 +97,17 @@ private:
                 if (idx >= job_n_) continue;  // not needed for this job
                 fn = fn_;
             }
-            (*fn)(idx);
+            call(*fn, idx);
             std::lock_guard<std::mutex> lk(mu_);
             if (--active_ == 0) done_cv_.notify_all();
         }
     }
 
     std::vector<std::thread> workers_;
-    std::mutex mu_, job_mu_;
-    std::condition_variable cv_, done_cv_;
+    std::mutex mu_, queue_mu_;
+    std::condition_variable cv_, done_cv_, queue_cv_;
+    uint64_t next_ticket_ = 0, serving_ = 0;
+    std::exception_ptr error_;
     const std::function<void(int)>* fn_ = nullptr;
     int active_ = 0, job_n_ = 0;
     uint64_t generation_ = 0;

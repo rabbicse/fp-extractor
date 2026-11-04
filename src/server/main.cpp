@@ -82,7 +82,10 @@ struct Config {
     std::string host = "0.0.0.0";
     int port = 8080;
     int match_threads = 0;
-    int http_threads = 8;
+    // Each keep-alive connection holds an HTTP thread, and searches wait in the
+    // gallery's FIFO queue, so keep this well above the expected client count:
+    // with 8 threads, 16 clients saw p95 latency 6x p50 (connections starved).
+    int http_threads = 64;
     std::string api_key;  // empty = no auth
     float verify_threshold = kVerifyThreshold;
     float identify_threshold = kIdentifyThreshold;  // one finger presented (1:N)
@@ -96,7 +99,7 @@ struct Config {
 
 void usage() {
     std::puts(
-        "fpx-server [--db gallery.fpxdb] [--host 0.0.0.0] [--port 8080] [--threads N] [--http-threads 8]\n"
+        "fpx-server [--db gallery.fpxdb] [--host 0.0.0.0] [--port 8080] [--threads N] [--http-threads 64]\n"
         "           [--api-key KEY]\n"
         "           [--verify-threshold 12]       1:1, one finger\n"
         "           [--identify-threshold 18]     1:N, one finger presented\n"
