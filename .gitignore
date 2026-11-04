@@ -39,3 +39,8 @@ apps/web/playwright-report/
 # run-all reports
 test-reports/
 __pycache__/
+
+# local scanner samples (real biometric data) - never commit
+samle/
+sample/
+samples/

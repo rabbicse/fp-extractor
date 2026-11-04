@@ -33,7 +33,11 @@ COPY third_party/ /opt/deps-src/third_party/
 RUN printf '%s\n' 'cmake_minimum_required(VERSION 3.16)' 'project(fpx_deps C CXX)' \
         'set(FPX_BUILD_SERVER ON)' 'set(FPX_BUILD_TESTS ON)' 'include(cmake/Dependencies.cmake)' \
         > /opt/deps-src/CMakeLists.txt \
- && cmake -S /opt/deps-src -B /opt/deps -Wno-dev
+ && cmake -S /opt/deps-src -B /opt/deps -Wno-dev \
+ && find /opt/deps -mindepth 1 -maxdepth 1 ! -name _deps -exec rm -rf {} + \
+ && rm -rf /opt/deps/_deps/*-build /opt/deps/_deps/*-subbuild
+# Only the sources stay: build dirs are created at run time by the (non-root)
+# user, since CMake cannot re-chmod files that root created.
 ENV FPX_CMAKE_ARGS="-DFETCHCONTENT_BASE_DIR=/opt/deps/_deps -DFETCHCONTENT_FULLY_DISCONNECTED=ON"
 
 # Web dependencies and Chromium (with its system libraries) for Playwright.
@@ -45,7 +49,7 @@ RUN cd /opt/web && npm ci --no-audit --no-fund \
 WORKDIR /src
 COPY . .
 RUN cp -a /opt/web/node_modules apps/web/ \
- && mkdir -p /tmp/home test-reports && chmod -R a+rwX /src /opt/cache /opt/deps /tmp/home
+ && mkdir -p /tmp/home test-reports && chmod -R a+rwX /src /opt/cache /opt/deps /opt/ms-playwright /tmp/home
 
 ENTRYPOINT ["scripts/run-all.sh"]
 CMD ["--skip", "docker"]

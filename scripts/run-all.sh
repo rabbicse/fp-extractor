@@ -10,7 +10,7 @@
 # Stages: tools build unit sanitizers accuracy bench examples gateway load web docker deploy
 # Logs and a summary go to test-reports/<timestamp>/. Exit code 1 if any stage failed.
 # Uses synthetic fingerprints only.
-# shellcheck disable=SC2329  # stage functions are called by name through `stage`
+# shellcheck disable=SC2329,SC2317  # stage functions are called by name through `stage` (SC2317: older shellcheck)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
