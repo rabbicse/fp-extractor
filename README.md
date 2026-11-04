@@ -34,6 +34,68 @@ files, enrol customers, identify with up to 10 fingers, compare two prints, and 
 
 See also: [architecture](docs/ARCHITECTURE.md), [capacity and hardware](docs/CAPACITY.md), [roadmap](docs/ROADMAP.md).
 
+## End-to-end flow
+
+```mermaid
+flowchart LR
+  S[Scanner SDK<br/>bitmap] --> D[Decode<br/>BMP / PGM / TIFF / WSQ]
+  D --> W[WSQ<br/>archive copy]
+  D --> X[FingerJet<br/>minutiae]
+  X --> T[ANSI-378 MINEX<br/>or ISO-19794-2]
+  T -->|PUT /v1/subjects/id| E[Enrol]
+  E --> L[(Append-only<br/>store .fpxdb)]
+  E --> G[(RAM gallery)]
+  L -. replay on restart .-> G
+  T -->|POST /v1/identify| Q[1:N scan<br/>all cores]
+  G --> Q
+  Q --> F[Per-customer<br/>finger fusion]
+  F --> R[Match / no match<br/>+ ranked candidates]
+```
+
+| Step | What happens | CLI | REST / C API | Code |
+|---|---|---|---|---|
+| 1. Capture | The scanner SDK gives a bitmap. Most sensors are 500 dpi; pass `--dpi` / `"dpi"` if the file does not say. | | | |
+| 2. Decode | BMP (1/4/8/24/32-bit), PGM, uncompressed TIFF or WSQ becomes an 8-bit grey image. | `fpx info` | | `image.cpp` |
+| 3. Archive | Optional WSQ copy, about 14:1 smaller (126 KB BMP → 9 KB). | `fpx convert` | `/v1/extract` `"wsq": true`, `fpx_image_to_wsq()` | `wsq.cpp` (NIST NBIS) |
+| 4. Extract | FingerJet finds ridge endings and bifurcations and writes a ~0.5 KB template. | `fpx extract` | `/v1/extract`, `fpx_extract_from_image()` | `extractor.cpp`, `template.cpp` |
+| 5. Enrol | Up to 10 fingers per customer are appended to the store, then compiled into the RAM gallery. | `fpx enroll` | `PUT /v1/subjects/{id}` | `store.cpp`, `gallery.cpp` |
+| 6. Identify | Each probe finger is compared with every enrolled finger at the same position, on all cores. Concurrent searches are queued first come, first served. | `fpx identify` | `POST /v1/identify` | `gallery.cpp`, `matcher.cpp` |
+| 7. Decide | Two fingers presented: match if both score ≥ 12, or one scores ≥ 30. One finger: match if it scores ≥ 18. | | response `match`, `candidates` | `FusionPolicy` |
+| 8. Verify (1:1) | Same comparison against one claimed customer, threshold 12. | `fpx match` | `POST /v1/verify`, `/v1/match`, `fpx_match()` | `matcher.cpp` |
+
+Devices that can run native code do steps 2–4 themselves with `libfpx` (or any vendor SDK that
+writes ANSI-378 / ISO-19794-2) and send only the template. Thin clients send the image and the
+server does steps 2–4. Several `fpx-server` processes can sit behind the Go gateway
+(`examples/go-gateway`), which keeps all fingers of a customer on the same shard.
+
+## Test everything with one command
+
+```bash
+scripts/run-all.sh            # everything except sanitizers and 1 M benchmarks (~15 min)
+scripts/run-all.sh --quick    # fast loop: no Docker, smaller benchmarks and load test (~5 min)
+scripts/run-all.sh --full     # also ASan/UBSan and the 1 M benchmarks (~30 min, ~4 GB RAM)
+scripts/run-all.sh --only web,examples      # or --skip docker
+```
+
+| Stage | What it checks |
+|---|---|
+| `tools` | compilers and tools; installs CMake for the user (uv / pipx / pip) if it is missing |
+| `build` | Release build with no compiler warnings in project code |
+| `unit` | `ctest`: 35 doctest cases, CLI smoke tests, REST API end-to-end tests including restart persistence |
+| `sanitizers` | Debug build with AddressSanitizer and UBSan, the whole suite, including the server processes (`--full`) |
+| `accuracy` | `fpx eval --synthetic`: EER, FNMR, FMR through the real FingerJet pipeline; fails on any false match |
+| `bench` | `fpx bench`, 1 and 2 fingers per customer; fails on a false alarm |
+| `examples` | `fpx demo`, the C++ example, Python ctypes, the full CLI walk-through, the Python REST client, every route in `requests.http` |
+| `gateway` | Go gateway in front of two shards: enrol, spread, identify, verify, auth, delete (`tests/gateway_e2e.py`) |
+| `load` | `fpx gendb` + `tests/load_test.py`: HTTP throughput and p50/p95/p99 latency at 1, 4, 16 clients; fails on errors, false matches, or any answer that differs from the single-client answer |
+| `web` | web unit tests, production build, Playwright end-to-end journey with screenshot comparison |
+| `docker` | image build (runs the tests inside), container HEALTHCHECK and auth, compose with 2 shards + gateway |
+| `deploy` | shellcheck and compose file validation |
+
+Logs, a `summary.md`, the load test JSON and the screenshots are written to `test-reports/<timestamp>/`.
+Screenshot baselines are kept per OS (`apps/web/e2e/snapshots/*-linux.png`). On a new OS the first run
+writes them; review and commit them.
+
 ---
 
 ## Quick start (Linux / macOS / WSL)
@@ -46,7 +108,7 @@ git clone https://github.com/rabbicse/fp-extractor
 cd fp-extractor
 cmake -S . -B build -Wno-dev            # Release by default
 cmake --build build -j
-(cd build && ctest --output-on-failure)  # 27 test cases + CLI smoke tests
+(cd build && ctest --output-on-failure)  # 35 test cases + CLI smoke tests + REST e2e
 ```
 
 Ubuntu packages: `sudo apt install build-essential cmake git`.

@@ -4,6 +4,11 @@ Everything here runs without a scanner and without real fingerprints, because
 the repository includes a synthetic fingerprint generator. Real-data steps
 are at the end.
 
+**All of it in one command:** `scripts/run-all.sh` (add `--quick` for a fast
+loop, `--full` for sanitizers and 1 M benchmarks). It runs every section below
+and writes logs and a summary to `test-reports/<timestamp>/`. See the
+[README](../README.md#test-everything-with-one-command) for the stage list.
+
 ## 1. Automated tests
 
 ```bash
@@ -25,6 +30,11 @@ cd build && ctest --output-on-failure
 | `cli_demo`, `cli_bench_small` | the CLI works end to end |
 
 Run a subset: `build/tests/fpx_tests -tc="*WSQ*"`; list: `build/tests/fpx_tests -ltc`.
+
+Web app (`apps/web`): `npm test` (unit), `npm run build`, then
+`FPX_SERVER=../../build/fpx-server npm run e2e` (Playwright journey with
+screenshot comparison; baselines per OS in `e2e/snapshots/*-<platform>.png`,
+refresh them with `npm run e2e -- --update-snapshots=all` after an intended UI change).
 
 ## 2. Manual walk-through (5 minutes)
 
@@ -85,6 +95,27 @@ fingers (must be found at rank 1 above the identify threshold) and
 non-enrolled fingers (best score must stay below it), and prints latency,
 throughput and the projection for 1 M templates.
 
+### HTTP load test
+
+`fpx bench` measures the matcher inside one process. To load the real server
+over HTTP, generate a store and probes, start a server on it, and run the load
+test (Python standard library only):
+
+```bash
+build/fpx gendb --db load.fpxdb --subjects 100000 --fingers 2 --probes 40 --probe-dir load-probes
+build/fpx-server --db load.fpxdb --port 8080 &
+python3 tests/load_test.py --url http://127.0.0.1:8080 --probes load-probes --concurrency 1,4,16 --duration 20
+```
+
+It first sends each probe once to record the reference answers and the
+accuracy, then sends searches from 1, 4 and 16 clients and prints requests/s
+and p50/p95/p99 latency. It fails on HTTP errors, on any false match, and on any
+answer under load that differs from the single-client answer. A search already
+uses every core, so more clients add queueing, not throughput: latency grows
+with the number of clients waiting. Searches are served first come, first
+served. Keep `--http-threads` (default 64) above the number of concurrent
+clients, because each keep-alive connection holds one HTTP thread.
+
 ## 5. Server
 
 ```bash
@@ -98,6 +129,16 @@ python3 examples/python/client.py stats
 ```
 
 Or open `examples/http/requests.http` in VS Code (REST Client) / JetBrains.
+
+Sharded, with the Go gateway in front of two shards:
+
+```bash
+build/fpx-server --db shard0.fpxdb --port 8081 &
+build/fpx-server --db shard1.fpxdb --port 8082 &
+(cd examples/go-gateway && go run . -shards http://127.0.0.1:8081,http://127.0.0.1:8082 -listen :9090) &
+python3 tests/gateway_e2e.py --gateway http://127.0.0.1:9090 --demo fpx-demo \
+    --shards http://127.0.0.1:8081,http://127.0.0.1:8082
+```
 
 ## 6. Language bindings
 

@@ -26,6 +26,36 @@ These are small probe counts on a laptop, with other work running on some of the
 as indicative. Speed ranged from 130,000 to 200,000 comparisons/s across runs. Impostor results come
 from only 1-2 non-enrolled probes per run, far too few to establish a false-match rate.
 
+### Linux desktop, 2026-11-04
+
+**Measured, synthetic.** Intel Core i7-6700 (4 cores, 8 threads, 2016), 30 GB RAM, Ubuntu,
+GCC 15, Release build. Nothing else running. Searches run one at a time.
+
+| Gallery | Average search | Worst search | RAM | Build time | Rank-1 accepted | Best impostor score | Probes |
+|---|---|---|---|---|---|---|---|
+| 100,000 templates | 0.370 s | 0.839 s | 292 MB | 0.9 s | 19/20 | 9.8 | 20 + 5 impostors |
+| 1M templates | 3.95 s | 8.07 s | 1.55 GB | 7.8 s | 20/20 | 12.2 | 20 + 5 impostors |
+| 100,000 customers × 2 fingers | 0.854 s | 1.245 s | 300 MB | 1.5 s | 10/10 | 10.2, no false alarms | 10 + 5 impostors |
+| 1M customers × 2 fingers | 7.98 s | 10.05 s | 3.0 GB | 15.4 s | 10/10 | 15.2, no false alarms | 10 + 5 impostors |
+
+The one 100,000-template miss found the right customer at rank 1 with a score of 15.6, under the
+single-finger threshold of 18: a weak synthetic impression, not a search error.
+
+**HTTP load test, measured, synthetic.** `tests/load_test.py` against `fpx-server` over HTTP, gallery of
+100,000 customers × 2 fingers, two-finger probes (40 genuine, 10 impostor), 15 s per level:
+
+| Clients | Searches/s | p50 | p95 | p99 |
+|---|---|---|---|---|
+| 1 | 1.18 | 0.87 s | 1.05 s | 1.37 s |
+| 4 | 1.22 | 3.32 s | 3.75 s | 3.84 s |
+| 16 | 1.27 | 12.2 s | 13.5 s | 14.0 s |
+
+Accuracy over the probes: 39/40 genuine accepted, 0 false matches, and no answer under load differed
+from the single-client answer. Each search already uses every core, so extra clients queue:
+throughput stays flat and latency grows with the queue. Before the 2026-11-04 fixes (first-come,
+first-served search queue, 64 HTTP threads) the same 16-client run had p50 6.7 s and p95 32.4 s,
+because some connections were starved.
+
 ### Conversion, one sample synthetic print
 
 | Step | Size |
