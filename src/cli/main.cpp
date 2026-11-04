@@ -53,6 +53,9 @@ Testing / benchmarking
   bench [--gallery 100000] [--probes 20] [--threads N] [--fingers 1|2]
                                       1:N benchmark on synthetic templates; --fingers 2 enrols
                                       and searches two fingers (right + left index) per subject
+  gendb --db <file> [--subjects 10000] [--fingers 1|2] [--probes P --probe-dir DIR]
+                                      Synthetic store for server load tests, plus genuine and
+                                      impostor probe templates listed in DIR/probes.json
 
 Common options: --dpi N (default 500 when the file has none), -v/--verbose,
   --matcher "key=value,..."  override matcher parameters (see include/fpx/matcher.hpp)
@@ -328,7 +331,10 @@ int cmd_identify(const Args& a) {
         for (auto& f : c.fingers) std::printf(" [%u->%u %.1f]", f.probe_finger, f.gallery_finger, f.score);
         std::printf("\n");
     }
-    return (!r.candidates.empty() && r.candidates[0].match) ? 0 : 1;
+    const bool matched = !r.candidates.empty() && r.candidates[0].match;
+    if (matched) std::printf("result: MATCH %s\n", r.candidates[0].id.c_str());
+    else std::printf("result: NO MATCH%s\n", r.candidates.empty() ? " (no candidate scored above 0)" : "");
+    return matched ? 0 : 1;
 }
 
 int cmd_synth(const Args& a) {
@@ -739,6 +745,58 @@ int cmd_bench(const Args& a) {
     return 0;
 }
 
+// Synthetic store + probe files for server load tests. Same generators and ids
+// as `bench`, so a server started on the store behaves like the benchmark.
+int cmd_gendb(const Args& a) {
+    if (!a.has("--db")) throw Error("usage: fpx gendb --db F --subjects N [--fingers 1|2] [--probes P --probe-dir D]");
+    const size_t N = size_t(a.geti("--subjects", 10000));
+    const int fingers = a.geti("--fingers", 1);
+    if (fingers != 1 && fingers != 2) throw Error("gendb: --fingers must be 1 or 2");
+    const int P = a.geti("--probes", 0);
+    if (P > 0 && !a.has("--probe-dir")) throw Error("gendb: --probes needs --probe-dir");
+    // 1 finger: position 0, synthesize_template(i). 2 fingers: positions 2 and 7, as in `bench --fingers 2`.
+    const std::vector<uint8_t> positions = fingers == 1 ? std::vector<uint8_t>{0} : std::vector<uint8_t>{2, 7};
+    auto tmpl = [&](uint64_t subject, uint8_t pos) {
+        return fingers == 1 ? synthesize_template(subject) : synthesize_template(subject * 16 + pos);
+    };
+    const auto fmt = TemplateFormat::Iso19794_2_2005;
+    const double t0 = now_ms();
+    {
+        TemplateStore store(a.get("--db"));
+        for (size_t i = 0; i < N; ++i)
+            for (uint8_t pos : positions)
+                store.put(make_store_key("subject-" + std::to_string(i), pos), serialize_template(tmpl(i, pos), fmt));
+        store.sync();
+    }
+    std::printf("wrote %zu subjects x %d finger(s) to %s in %.1f s\n", N, fingers, a.get("--db").c_str(),
+                (now_ms() - t0) / 1000);
+    if (P <= 0) return 0;
+
+    // Probes: P genuine (perturbed enrolled fingers) and max(1, P/4) impostors (never enrolled).
+    // The manifest lists, per probe, the expected id (null for impostors) and one file per finger.
+    const std::filesystem::path dir = a.get("--probe-dir");
+    std::filesystem::create_directories(dir);
+    std::string manifest = "[\n";
+    auto add = [&](const std::string& name, uint64_t subject, const char* expect, uint64_t seed) {
+        manifest += std::string(manifest.size() > 2 ? ",\n" : "") + "  {\"expect\": " + expect + ", \"fingers\": [";
+        for (size_t k = 0; k < positions.size(); ++k) {
+            const std::string file = name + "_" + std::to_string(positions[k]) + ".iso";
+            write_file((dir / file).string(), serialize_template(perturb_template(tmpl(subject, positions[k]), seed + k * 4000), fmt));
+            manifest += std::string(k ? ", " : "") + "{\"position\": " + std::to_string(positions[k]) + ", \"file\": \"" + file + "\"}";
+        }
+        manifest += "]}";
+    };
+    for (int p = 0; p < P; ++p) {
+        const uint64_t target = (uint64_t(p) * 2654435761u) % N;
+        add("genuine" + std::to_string(p), target, ("\"subject-" + std::to_string(target) + "\"").c_str(), 1000 + p);
+    }
+    for (int p = 0; p < std::max(1, P / 4); ++p) add("impostor" + std::to_string(p), N + 1000000 + p, "null", 7 + p);
+    manifest += "\n]\n";
+    write_file((dir / "probes.json").string(), std::vector<uint8_t>(manifest.begin(), manifest.end()));
+    std::printf("wrote %d genuine + %d impostor probes to %s/probes.json\n", P, std::max(1, P / 4), dir.string().c_str());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -766,6 +824,7 @@ int main(int argc, char** argv) {
         if (cmd == "demo") return cmd_demo(a);
         if (cmd == "eval") return cmd_eval(a);
         if (cmd == "bench") return cmd_bench(a);
+        if (cmd == "gendb") return cmd_gendb(a);
         std::fprintf(stderr, "unknown command '%s'\n\n%s", cmd.c_str(), kUsage);
         return 2;
     } catch (const std::exception& e) {
