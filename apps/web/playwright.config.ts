@@ -11,7 +11,7 @@ export default defineConfig({
   testDir: "e2e",
   timeout: 120_000,
   workers: 1,
-  snapshotPathTemplate: "e2e/snapshots/{arg}{ext}",
+  snapshotPathTemplate: "e2e/snapshots/{arg}-{platform}{ext}", // fonts render differently per OS
   expect: { toHaveScreenshot: { maxDiffPixelRatio: 0.02, animations: "disabled" } },
   use: { baseURL: "http://127.0.0.1:8099", viewport: { width: 1360, height: 900 }, colorScheme: "light" },
   webServer: {

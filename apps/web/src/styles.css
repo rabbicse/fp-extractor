@@ -92,6 +92,7 @@ nav button[aria-current="page"] { border-bottom-color: var(--prussian); font-wei
 .key { display: block; width: 12px; height: 12px; border: 2px solid; }
 .key.ending { border-color: #c4144f; border-radius: 50%; }
 .key.bifurcation { border-color: #00746b; }
+.key.other { border-color: #143d7a; border-radius: 50%; }
 .form-screen { display: grid; gap: 1rem; max-width: 38rem; justify-items: start; }
 .form-screen.wide { max-width: none; }
 .form-screen p { margin: 0; }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, downloadBase64 } from "./api";
 import type { CompareResult, CrossMatch, IdentifyResult, Stats } from "./api";
-import { heat } from "./geometry";
+import { heat, minutiaClass } from "./geometry";
 import { ComparePlates, Plate } from "./Plates";
 import benchmarks from "./benchmarks.json";
 import { estimate, GALLERIES } from "./capacity";
@@ -74,6 +74,9 @@ export function ScanScreen({ selected }: ScreenProps) {
         <dl className="legend">
           <div><dt><i className="key ending" /></dt><dd>Ridge ending</dd></div>
           <div><dt><i className="key bifurcation" /></dt><dd>Bifurcation</dd></div>
+          {ins.minutiae.some((m) => minutiaClass(m.type) === "other") && (
+            <div><dt><i className="key other" /></dt><dd>Other</dd></div>
+          )}
         </dl>
         <div className="row">
           <button onClick={() => downloadBase64(`${stem}.ansi`, ins.template_ansi)}>Download MINEX</button>
