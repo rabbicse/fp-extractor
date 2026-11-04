@@ -1,13 +1,14 @@
 # TODO / resume notes
 
-Last session: 2026-11-04 (evening) to 2026-11-05 (midnight). Branch
-`test/run-all-and-concurrency-fixes` (not pushed: a push to `master` deploys).
+Last session: 2026-11-04 (evening) to 2026-11-05 (midnight). All work is merged
+into local `master`, which is ahead of `origin/master` and not pushed yet: a push to
+`master` runs the auto-deploy (tests -> Docker image -> SSH deploy).
 
 ## Resume
 
 ```bash
 cd /mnt/7A4CEE3F674E3964/github/fp-extractor
-git checkout test/run-all-and-concurrency-fixes
+git checkout master
 scripts/run-all.sh --quick          # ~2 min sanity check, everything should pass
 ```
 
@@ -69,7 +70,8 @@ CMake and shellcheck were installed with `uv tool install` (no sudo).
    per comparison, 671 index items scanned per comparison); multi-finger search prunes only
    below 3.0 - a per-subject top-k bound would prune more. Larger wins need the planned
    bit-signature pre-filter (roadmap stage 2), which is a go/no-go decision, not exact.
-8. Push the branch and open a PR to `master` when happy (merging deploys).
+8. `git push origin master` when ready to deploy (CI runs all tests first and rolls back on a
+   failed health check). The deploy needs the GitHub settings in docs/DEPLOYMENT.md.
 
 ## Measured (i7-6700, 4C/8T, 30 GB, Ubuntu 26.04, GCC 15, synthetic data)
 
