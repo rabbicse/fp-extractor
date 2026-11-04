@@ -104,19 +104,30 @@ public:
     const CompiledTemplate& tmpl() const { return t_; }
 
     // Internal: quantised edge index.
-    static constexpr int kDBins = 64, kABins = 16, kBBins = 16;
+    // Bin width as a shift: length bins of 2^kDShift units (2 px each), angle
+    // bins of 2^kAShift / 2^kBShift (1/256 turn).
+    static constexpr int kDShift = 2, kAShift = 4, kBShift = 4;  // speed only; scores do not depend on it
+    static constexpr int kDBins = 256 >> kDShift, kABins = 256 >> kAShift, kBBins = 256 >> kBShift;
     static constexpr int kBuckets = kDBins * kABins * kBBins;
     static int bucket(const CEdge& e) {
-        return ((e.d >> 2) * kABins + (e.a >> 4)) * kBBins + (e.b >> 4);
+        return ((e.d >> kDShift) * kABins + (e.a >> kAShift)) * kBBins + (e.b >> kBShift);
     }
+    /// A probe edge in the index, with what the inner matching loop needs
+    /// precomputed: the edge-length tolerance as an exact integer bound and the
+    /// angle of the probe minutia i.
+    struct Item {
+        uint8_t d, a, b, i, j;
+        uint8_t angle_i;  ///< angle of probe minutia i
+        int16_t max_dd;   ///< |d_probe - d_candidate| must be <= max_dd
+    };
     const uint32_t* offsets() const { return offsets_.data(); }
-    const CEdge* items() const { return items_.data(); }
+    const Item* items() const { return items_.data(); }
 
 private:
     void build(const MatcherConfig& cfg);
     CompiledTemplate t_;
     std::vector<uint32_t> offsets_;  // kBuckets + 1
-    std::vector<CEdge> items_;       // copies of probe edges, grouped by bucket
+    std::vector<Item> items_;        // probe edges, grouped by bucket
 };
 
 struct MatchDetails {
@@ -136,8 +147,13 @@ public:
     const MatcherConfig& config() const { return cfg_; }
 
     /// Score in [0, 100]. Thread-safe, allocation-free unless `details->pairs` wanted.
+    ///
+    /// `need_above` (1:N searches): the caller only uses scores strictly above
+    /// this value. When an exact upper bound on the score, known before the
+    /// expensive alignment, is <= need_above, 0 is returned without aligning.
+    /// Scores above need_above are always exact. Ignored when `details` is set.
     float match(const Probe& probe, const TemplateView& candidate,
-                MatchDetails* details = nullptr, bool want_pairs = false) const;
+                MatchDetails* details = nullptr, bool want_pairs = false, float need_above = -1.f) const;
 
     /// Convenience 1:1 comparison.
     float match(const FingerTemplate& a, const FingerTemplate& b, MatchDetails* details = nullptr) const;

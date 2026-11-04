@@ -19,6 +19,10 @@ include(cmake/Dependencies.cmake)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   set(FPX_WARNINGS -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+  # Identical scores on every build: no fused multiply-add contraction, which
+  # compilers otherwise apply on ARM64 (Apple M1, Graviton) and with
+  # -march=native on x86, changing float rounding in the matcher.
+  set(FPX_FP_EXACT -ffp-contract=off)
   if(FPX_NATIVE_ARCH)
     add_compile_options(-march=native)
   endif()
@@ -43,7 +47,7 @@ add_library(fpx_core STATIC
 add_library(fpx::core ALIAS fpx_core)
 target_include_directories(fpx_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(fpx_core PRIVATE fingerjet nbis_wsq PUBLIC Threads::Threads)
-target_compile_options(fpx_core PRIVATE ${FPX_WARNINGS})
+target_compile_options(fpx_core PRIVATE ${FPX_WARNINGS} ${FPX_FP_EXACT})
 
 # Shared C library for FFI (Python ctypes, C#, Java/JNA, Go cgo, ...)
 add_library(fpx SHARED src/core/c_api.cpp)

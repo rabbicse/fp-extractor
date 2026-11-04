@@ -18,9 +18,10 @@ constexpr int kMaxCorr = 8192;  // dense templates (100+ minutiae) need several 
 constexpr int kMaxPairs = 4096;
 constexpr int kRotWindow = 14;  // 1/256 turn: correspondences consistent with the consensus rotation
 
-inline int angdiff(int a, int b) {  // circular distance in 1/256 turn
-    int d = (a - b) & 255;
-    return d > 128 ? 256 - d : d;
+inline int angdiff(int a, int b) {  // circular distance in 1/256 turn, 0..128
+    // |int8(a - b)|: equals (d > 128 ? 256 - d : d) for d = (a - b) & 255,
+    // including d = 128, without a branch.
+    return std::abs(int(int8_t(uint8_t(a - b))));
 }
 
 // Direction of the vector (dx, dy) in image coordinates (y down) expressed as
@@ -42,6 +43,25 @@ struct Tables {
 };
 const Tables g_tables;
 inline const Tables& tables() { return g_tables; }
+
+// Ascending sort of 16-bit keys: two 8-bit LSD radix passes. Same result as
+// std::sort (a sorted integer array is unique), about 3x faster for the few
+// hundred keys of a comparison.
+void radix_sort16(uint16_t* keys, int n) {
+    if (n < 2) return;
+    uint16_t tmp[2 * kMaxCorr];
+    int lo[257] = {0}, hi[257] = {0};
+    for (int k = 0; k < n; ++k) {
+        ++lo[(keys[k] & 255) + 1];
+        ++hi[(keys[k] >> 8) + 1];
+    }
+    for (int b = 0; b < 256; ++b) {
+        lo[b + 1] += lo[b];
+        hi[b + 1] += hi[b];
+    }
+    for (int k = 0; k < n; ++k) tmp[lo[keys[k] & 255]++] = keys[k];
+    for (int k = 0; k < n; ++k) keys[hi[tmp[k] >> 8]++] = tmp[k];
+}
 
 struct Corr {
     uint8_t pi, ci, pj, cj;
@@ -168,20 +188,20 @@ void Probe::build(const MatcherConfig& cfg) {
     auto for_each_bucket = [&](const CEdge& e, auto&& fn) {
         const double tol_px = cfg.edge_dist_tol + cfg.edge_dist_tol_rel * e.d * 2.0;
         const int dt = int(std::ceil(tol_px / 2.0));
-        const int d0 = std::max(0, e.d - dt) >> 2, d1 = std::min(255, e.d + dt) >> 2;
+        const int d0 = std::max(0, e.d - dt) >> kDShift, d1 = std::min(255, e.d + dt) >> kDShift;
         const int a0 = e.a - at, b0 = e.b - at;
-        const int na = ((at * 2) >> 4) + 2, nb = na;
+        const int na = ((at * 2) >> kAShift) + 2, nb = ((at * 2) >> kBShift) + 2;
         for (int db = d0; db <= d1; ++db) {
             int last_ab = -1;
             for (int ia = 0; ia < na; ++ia) {
-                int av = std::min(a0 + ia * 16, e.a + at);
-                int ab = (av & 255) >> 4;
+                int av = std::min(a0 + ia * (1 << kAShift), e.a + at);
+                int ab = (av & 255) >> kAShift;
                 if (ab == last_ab) continue;
                 last_ab = ab;
                 int last_bb = -1;
                 for (int ib = 0; ib < nb; ++ib) {
-                    int bv = std::min(b0 + ib * 16, e.b + at);
-                    int bb = (bv & 255) >> 4;
+                    int bv = std::min(b0 + ib * (1 << kBShift), e.b + at);
+                    int bb = (bv & 255) >> kBShift;
                     if (bb == last_bb) continue;
                     last_bb = bb;
                     fn((db * kABins + ab) * kBBins + bb);
@@ -191,10 +211,19 @@ void Probe::build(const MatcherConfig& cfg) {
     };
     for (const CEdge& e : t_.edges) for_each_bucket(e, [&](int b) { ++offsets_[b + 1]; });
     for (int b = 0; b < kBuckets; ++b) offsets_[b + 1] += offsets_[b];
-    items_.assign(offsets_[kBuckets], CEdge{});
+    items_.assign(offsets_[kBuckets], Item{});
     std::vector<uint32_t> fill(offsets_.begin(), offsets_.end() - 1);
-    for (size_t idx = 0; idx < t_.edges.size(); ++idx)
-        for_each_bucket(t_.edges[idx], [&](int b) { items_[fill[b]++] = t_.edges[idx]; });
+    const float dtol_abs = cfg.edge_dist_tol * 0.5f, dtol_rel = cfg.edge_dist_tol_rel;
+    for (size_t idx = 0; idx < t_.edges.size(); ++idx) {
+        const CEdge& e = t_.edges[idx];
+        // Integer form of the length test in match(): for an integer dd,
+        // float(dd) > T  <=>  dd > floor(T).
+        const float T = dtol_abs + dtol_rel * e.d;
+        const double f = std::floor(double(T));
+        const Item it{e.d, e.a, e.b, e.i, e.j, t_.minutiae[e.i].angle,
+                      int16_t(f < -1.0 ? -1 : f > 255.0 ? 255 : int(f))};
+        for_each_bucket(e, [&](int b) { items_[fill[b]++] = it; });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +248,7 @@ int pair_minutiae(const CompiledTemplate& P, const TemplateView& C, const Transf
         cy[j] = -T.s * m.x + T.c * m.y + T.ty;
         ca[j] = uint8_t((m.angle + T.rot) & 255);
     }
-    PairCand cand[kMaxPairs];
+    PairCand cand[kMaxPairs + 1];  // +1: branchless append writes one slot ahead
     int nc = 0;
     const float base = cfg.pair_dist_tol * tol_scale;
     for (int i = 0; i < nP && nc < kMaxPairs; ++i) {
@@ -230,10 +259,9 @@ int pair_minutiae(const CompiledTemplate& P, const TemplateView& C, const Transf
         for (int j = 0; j < nC; ++j) {
             const float dx = cx[j] - p.x, dy = cy[j] - p.y;
             const float d2 = dx * dx + dy * dy;
-            if (d2 > tol2) continue;
             const int da = angdiff(p.angle, ca[j]);
-            if (da > cfg.pair_angle_tol) continue;
-            cand[nc++] = {d2 / tol2 + float(da) / cfg.pair_angle_tol, uint8_t(i), uint8_t(j)};
+            cand[nc] = {d2 / tol2 + float(da) / cfg.pair_angle_tol, uint8_t(i), uint8_t(j)};
+            nc += int(d2 <= tol2) & int(da <= cfg.pair_angle_tol);
             if (nc == kMaxPairs) break;
         }
     }
@@ -256,26 +284,32 @@ int count_compatible(const CompiledTemplate& P, const TemplateView& C, const Tra
                      const MatcherConfig& cfg) {
     const int nP = int(P.minutiae.size()), nC = C.n_minutiae;
     float cx[256], cy[256];
-    uint8_t ca[256];
+    int ca[256];
     for (int j = 0; j < nC; ++j) {
         const CMinutia& m = C.minutiae[j];
         cx[j] = T.c * m.x + T.s * m.y + T.tx;
         cy[j] = -T.s * m.x + T.c * m.y + T.ty;
-        ca[j] = uint8_t((m.angle + T.rot) & 255);
+        ca[j] = (m.angle + T.rot) & 255;
     }
     int count = 0;
+    const int atol = cfg.pair_angle_tol;
     for (int i = 0; i < nP; ++i) {
         const CMinutia& p = P.minutiae[i];
         const float sdx = p.x - seed_x, sdy = p.y - seed_y;
         const float tol = cfg.pair_dist_tol + cfg.pair_dist_growth * std::sqrt(sdx * sdx + sdy * sdy);
         const float tol2 = tol * tol;
+        const float px = p.x, py = p.y;
+        const int pa = p.angle;
+        // No early break: a branch-free OR over all candidates vectorises and
+        // avoids mispredictions; the result (any compatible?) is the same.
+        int any = 0;
         for (int j = 0; j < nC; ++j) {
-            const float dx = cx[j] - p.x, dy = cy[j] - p.y;
-            if (dx * dx + dy * dy <= tol2 && angdiff(p.angle, ca[j]) <= cfg.pair_angle_tol) {
-                ++count;
-                break;
-            }
+            const float dx = cx[j] - px, dy = cy[j] - py;
+            const int d = (pa - ca[j]) & 255;
+            const int ad = d > 128 ? 256 - d : d;
+            any |= int(dx * dx + dy * dy <= tol2) & int(ad <= atol);
         }
+        count += any;
     }
     return count;
 }
@@ -335,29 +369,31 @@ void bbox(const CMinutia* m, int n, float& x0, float& y0, float& x1, float& y1) 
 
 }  // namespace
 
-float Matcher::match(const Probe& probe, const TemplateView& C, MatchDetails* det, bool want_pairs) const {
+float Matcher::match(const Probe& probe, const TemplateView& C, MatchDetails* det, bool want_pairs,
+                     float need_above) const {
     const CompiledTemplate& P = probe.tmpl();
     const int nP = int(P.minutiae.size()), nC = C.n_minutiae;
     if (det) *det = MatchDetails{};
     if (nP < 3 || nC < 3) return 0.f;
 
     // 1. Local structure correspondences via the probe's bucket index.
-    Corr corr[kMaxCorr];
+    Corr corr[kMaxCorr + 1];  // +1: the branchless append below writes one slot ahead
     int ncorr = 0;
     const uint32_t* off = probe.offsets();
-    const CEdge* items = probe.items();
+    const Probe::Item* items = probe.items();
     const int at = cfg_.edge_angle_tol;
-    const float dtol_abs = cfg_.edge_dist_tol * 0.5f, dtol_rel = cfg_.edge_dist_tol_rel;
     for (int k = 0; k < C.n_edges && ncorr < kMaxCorr; ++k) {
         const CEdge& ce = C.edges[k];
         const int b = Probe::bucket(ce);
+        const int cang = C.minutiae[ce.i].angle;
+        // Branchless: the tests pass about half the time, so branches on them
+        // were mispredicted constantly (the most expensive part of 1:N).
         for (uint32_t q = off[b], qe = off[b + 1]; q < qe; ++q) {
-            const CEdge& pe = items[q];
-            const int dd = std::abs(int(pe.d) - int(ce.d));
-            if (float(dd) > dtol_abs + dtol_rel * pe.d) continue;
-            if (angdiff(pe.a, ce.a) > at || angdiff(pe.b, ce.b) > at) continue;
-            corr[ncorr++] = {pe.i, ce.i, pe.j, ce.j,
-                             uint8_t((P.minutiae[pe.i].angle - C.minutiae[ce.i].angle) & 255)};
+            const Probe::Item& pe = items[q];
+            const int ok = int(std::abs(int(pe.d) - int(ce.d)) <= pe.max_dd) & int(angdiff(pe.a, ce.a) <= at) &
+                           int(angdiff(pe.b, ce.b) <= at);
+            corr[ncorr] = {pe.i, ce.i, pe.j, ce.j, uint8_t((pe.angle_i - cang) & 255)};
+            ncorr += ok;
             if (ncorr == kMaxCorr) break;
         }
     }
@@ -394,7 +430,7 @@ float Matcher::match(const Probe& probe, const TemplateView& C, MatchDetails* de
     const int rot_mean = int(std::lround(std::atan2(sy, sx) * 128.0 / kPi)) & 255;
 
     // 3. Seeds = minutia pairs with most consistent local support.
-    std::sort(keys, keys + nkeys);
+    radix_sort16(keys, nkeys);
     struct Seed {
         int support;
         uint16_t key;
@@ -428,6 +464,33 @@ float Matcher::match(const Probe& probe, const TemplateView& C, MatchDetails* de
     if (nseeds == 0 || seeds[0].support < cfg_.min_pair_support || strong_keys < 3) {
         if (det) det->correspondences = ncorr;
         return 0.f;
+    }
+
+    // Exact score bound before alignment (1:N pruning, see need_above). A
+    // scoring pair (pi, ci) needs graph support >= min_pair_support, which is
+    // at most its local support counted above, so it is a strong key; pairs
+    // are one-to-one, so m <= S = min(distinct pi, distinct ci) over strong
+    // keys. Step 6 divides m^2 by two overlaps that are each >= max(m, floor),
+    // so score <= 100 S^2 / max(S, floor)^2. All operands are small integers
+    // (exact in float) and IEEE division is monotonic, so the bound also holds
+    // for the computed float score.
+    if (need_above >= 0.f && !det) {
+        uint8_t seen_p[256] = {0}, seen_c[256] = {0};
+        int dp = 0, dc = 0;
+        for (int k = 0; k < nkeys;) {
+            int e = k;
+            while (e < nkeys && keys[e] == keys[k]) ++e;
+            if (e - k >= cfg_.min_pair_support) {
+                const int pi = keys[k] >> 8, ci = keys[k] & 255;
+                dp += !seen_p[pi];
+                dc += !seen_c[ci];
+                seen_p[pi] = seen_c[ci] = 1;
+            }
+            k = e;
+        }
+        const float S = float(std::min(dp, dc));
+        const float denom = std::max(S, float(cfg_.min_overlap_minutiae));
+        if (std::min(100.f * S * S / (denom * denom), 100.f) <= need_above) return 0.f;
     }
 
     // 4. Rank seeds by a cheap compatibility count, then run the full greedy

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <exception>
 #include <functional>
@@ -327,7 +328,13 @@ IdentifyResult Gallery::identify(const Probe& probe, const IdentifyOptions& opt)
         float score;
         uint32_t idx;
     };
-    auto worse = [](const Hit& a, const Hit& b) { return a.score > b.score; };  // min-heap on score
+    // Total order: higher score first, then lower gallery index. Without the
+    // tie-break, which of several equal scores made the top-k depended on how
+    // threads happened to split the gallery, so results changed between runs.
+    auto better = [](const Hit& a, const Hit& b) { return a.score > b.score || (a.score == b.score && a.idx < b.idx); };
+    auto worse = better;  // as heap "less": front() is the worst kept hit
+    // Scores must be >= min_score: anything <= the next float below it is unused.
+    const float min_need = opt.min_score > 0.f ? std::nextafter(opt.min_score, 0.f) : 0.f;
     std::vector<std::vector<Hit>> local{size_t(threads)};
     std::vector<uint64_t> counts(size_t(threads), 0);
     const size_t chunk = 4096;  // dynamic chunking -> good load balance
@@ -345,12 +352,16 @@ IdentifyResult Gallery::identify(const Probe& probe, const IdentifyOptions& opt)
                 const Entry& e = entries_[i];
                 if (!e.alive) continue;
                 ++cnt;
-                float s = matcher_.match(probe, view_of(e));
+                // Only scores that could enter this thread's top-k matter (an
+                // equal score can still win on the index tie-break).
+                const float need =
+                    std::max(min_need, int(heap.size()) < top_k ? 0.f : std::nextafter(heap.front().score, 0.f));
+                float s = matcher_.match(probe, view_of(e), nullptr, false, need);
                 if (s < opt.min_score || s <= 0.f) continue;
                 if (int(heap.size()) < top_k) {
                     heap.push_back({s, uint32_t(i)});
                     std::push_heap(heap.begin(), heap.end(), worse);
-                } else if (s > heap.front().score) {
+                } else if (better({s, uint32_t(i)}, heap.front())) {
                     std::pop_heap(heap.begin(), heap.end(), worse);
                     heap.back() = {s, uint32_t(i)};
                     std::push_heap(heap.begin(), heap.end(), worse);
@@ -362,7 +373,7 @@ IdentifyResult Gallery::identify(const Probe& probe, const IdentifyOptions& opt)
 
     std::vector<Hit> all;
     for (auto& h : local) all.insert(all.end(), h.begin(), h.end());
-    std::sort(all.begin(), all.end(), [](const Hit& a, const Hit& b) { return a.score > b.score; });
+    std::sort(all.begin(), all.end(), better);
     if (int(all.size()) > top_k) all.resize(size_t(top_k));
     for (const Hit& h : all) {
         const Entry& e = entries_[h.idx];
@@ -438,6 +449,7 @@ SubjectIdentifyResult Gallery::identify_subjects(const std::vector<FingerProbe>&
     // Scores below this cannot influence any decision; dropping them keeps
     // the per-thread hit lists tiny (impostor scores are almost always ~0).
     const float floor = std::max(0.5f, 0.25f * std::min(opt.policy.finger_threshold, opt.policy.single_threshold));
+    const float need = std::nextafter(floor, 0.f);  // scores <= this are below floor
 
     std::shared_lock<std::shared_mutex> lk(mu_);
     const size_t n = entries_.size();
@@ -463,7 +475,7 @@ SubjectIdentifyResult Gallery::identify_subjects(const std::vector<FingerProbe>&
                 for (size_t p = 0; p < probes.size(); ++p) {
                     if (!positions_compatible(probes[p].finger, e.finger)) continue;
                     ++cnt;
-                    float s = matcher_.match(compiled[p], v);
+                    float s = matcher_.match(compiled[p], v, nullptr, false, need);
                     if (s >= floor) hits.push_back({e.subject, s, uint8_t(p), e.finger});
                 }
             }
@@ -473,7 +485,14 @@ SubjectIdentifyResult Gallery::identify_subjects(const std::vector<FingerProbe>&
 
     std::vector<SubjectHit> all;
     for (auto& h : local) all.insert(all.end(), h.begin(), h.end());
-    std::sort(all.begin(), all.end(), [](const SubjectHit& a, const SubjectHit& b) { return a.subject < b.subject; });
+    // Total order (thread-local lists arrive in scheduling order), so the
+    // per-subject finger assignment is the same on every run.
+    std::sort(all.begin(), all.end(), [](const SubjectHit& a, const SubjectHit& b) {
+        if (a.subject != b.subject) return a.subject < b.subject;
+        if (a.probe != b.probe) return a.probe < b.probe;
+        if (a.gallery_finger != b.gallery_finger) return a.gallery_finger < b.gallery_finger;
+        return a.score > b.score;
+    });
     std::vector<SubjectCandidate> cands;
     for (size_t i = 0; i < all.size();) {
         size_t j = i;
@@ -485,7 +504,8 @@ SubjectIdentifyResult Gallery::identify_subjects(const std::vector<FingerProbe>&
         cands.push_back(std::move(c));
         i = j;
     }
-    std::sort(cands.begin(), cands.end(), [](const SubjectCandidate& a, const SubjectCandidate& b) {
+    // Stable: equal candidates keep gallery (subject index) order.
+    std::stable_sort(cands.begin(), cands.end(), [](const SubjectCandidate& a, const SubjectCandidate& b) {
         if (a.match != b.match) return a.match;
         return a.score > b.score;
     });
